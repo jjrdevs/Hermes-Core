@@ -1,0 +1,52 @@
+{
+  "name": "design_review_workflow",
+  "steps": [
+    {
+      "id": "plan_architecture",
+      "role": "architect",
+      "objective": {"description": "Draft an architecture plan."},
+      "depends_on": [],
+      "outputs": ["architecture_plan"],
+      "constraints": {"allowed_tools": ["filesystem"]}
+    },
+    {
+      "id": "review_plan",
+      "role": "human_operator",
+      "objective": {"description": "Review the architecture plan and approve it."},
+      "depends_on": ["plan_architecture"],
+      "outputs": ["approval_decision"],
+      "constraints": {}
+    },
+    {
+      "id": "implement_design",
+      "role": "developer",
+      "objective": {"description": "Implement the approved architecture design."},
+      "depends_on": ["review_plan"],
+      "outputs": ["implementation_artifact"],
+      "constraints": {}
+    }
+  ],
+  "transitions": [
+    {
+      "priority": 100,
+      "condition": {
+        "event": "STEP_COMPLETED",
+        "artifact_type": "architecture_plan"
+      },
+      "action": {
+        "require_approval": {"role": "human_operator"}
+      }
+    }
+  ],
+  "tools": [
+    {
+      "tool_id": "filesystem",
+      "name": "Filesystem Tool",
+      "description": "A local filesystem read capability useful during architecture planning.",
+      "actions": ["read"],
+      "allowed_roles": ["architect"],
+      "metadata": {"version": "1.0"}
+    }
+  ],
+  "policy_refs": []
+}

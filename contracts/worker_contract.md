@@ -103,7 +103,7 @@ Examples:
 - verifier
 - researcher
 
-Workers are selected by role, not by model name.
+Workers are selected by role and capability need, not by a specific model implementation.
 
 ### objective
 
