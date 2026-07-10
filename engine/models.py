@@ -73,15 +73,17 @@ class Artifact:
         decision_record: Optional[Dict[str, Any]] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> "Artifact":
+        artifact_id = artifact_id or str(uuid.uuid4())
+        version = 1 if parent_version is None else parent_version + 1
         inputs = inputs or []
         metadata = metadata or {}
         decision_record = decision_record or {}
         created_at = _now_iso()
         content_hash = Artifact.compute_content_hash(content)
         base_record = {
-            "artifact_id": artifact_id or str(uuid.uuid4()),
+            "artifact_id": artifact_id,
             "artifact_type": artifact_type,
-            "version": 1 if parent_version is None else parent_version + 1,
+            "version": version,
             "title": title,
             "content": content,
             "content_hash": content_hash,
@@ -95,9 +97,9 @@ class Artifact:
         }
         artifact_hash = Artifact.compute_artifact_hash(base_record)
         return Artifact(
-            artifact_id=artifact_id or str(uuid.uuid4()),
+            artifact_id=artifact_id,
             artifact_type=artifact_type,
-            version=1 if parent_version is None else parent_version + 1,
+            version=version,
             title=title,
             content=content,
             content_hash=content_hash,

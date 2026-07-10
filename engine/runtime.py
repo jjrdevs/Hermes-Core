@@ -326,8 +326,6 @@ class RuntimeKernel:
         self._apply_event(event)
 
     def _emit_approval_required(self, workflow_execution_id: str, transition_action: Dict[str, Any]) -> None:
-        print("EMITTING APPROVAL")
-        traceback.print_stack(limit=5)
         workflow_execution = self.workflow_executions[workflow_execution_id]
         event = Event.create(
             event_type="APPROVAL_REQUIRED",
