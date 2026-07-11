@@ -4,6 +4,7 @@ import os
 import shlex
 import shutil
 import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -52,6 +53,17 @@ class FilesystemTool(BaseTool):
             path = self._resolve_path(parameters["path"])
             if not path.exists():
                 return ToolResult(status="ok", data={"path": str(path), "content": "", "exists": False})
+            if path.is_dir():
+                return ToolResult(
+                    status="ok",
+                    data={
+                        "path": str(path),
+                        "content": "",
+                        "exists": True,
+                        "is_directory": True,
+                        "entries": [entry.name for entry in path.iterdir()],
+                    },
+                )
             return ToolResult(status="ok", data={"path": str(path), "content": path.read_text(encoding="utf-8"), "exists": True})
         if action == "write_file":
             path = self._resolve_path(parameters["path"])
@@ -128,12 +140,17 @@ class ShellTool(BaseTool):
         if not command:
             raise ValueError("A shell command is required")
 
+        requested_command = list(command)
+        resolved_command = list(command)
+        if resolved_command[0] in {"python", "python3"}:
+            resolved_command = [sys.executable] + resolved_command[1:]
+
         cwd = parameters.get("cwd")
         timeout = parameters.get("timeout")
         env = parameters.get("env") or None
         started_at = time.perf_counter()
         completed = subprocess.run(
-            command,
+            resolved_command,
             cwd=str(cwd) if cwd is not None else None,
             env=env,
             capture_output=True,
@@ -150,7 +167,7 @@ class ShellTool(BaseTool):
             "succeeded": succeeded,
             "duration_ms": duration_ms,
             "metadata": {
-                "command": command,
+                "command": requested_command,
                 "cwd": cwd,
                 "timeout": timeout,
                 "allowed_commands": self.allowed_commands,
@@ -172,35 +189,104 @@ class GitTool(BaseTool):
             return shlex.split(command)
         return []
 
+    @staticmethod
+    def _validate_repo_path(repo_path: Any) -> Path:
+        resolved_repo = Path(repo_path).expanduser().resolve()
+        if not resolved_repo.exists():
+            raise ValueError(f"Repository path does not exist: {repo_path}")
+        if not resolved_repo.is_dir():
+            raise ValueError(f"Repository path is not a directory: {repo_path}")
+        return resolved_repo
+
     def execute(self, request: ToolRequest) -> ToolResult:
         parameters = request.parameters or {}
         action = request.action
         if action not in self.allowed_actions:
             raise ValueError(f"Git action not allowed: {action}")
 
-        repo_path = parameters.get("repo_path") or "."
-        command = ["git", action]
+        repo_path = self._validate_repo_path(parameters.get("repo_path") or ".")
+        if action == "inspect":
+            return self._inspect(repo_path)
         if action == "status":
-            command.append("--short")
-        started_at = time.perf_counter()
-        completed = subprocess.run(
-            command,
-            cwd=str(repo_path),
-            capture_output=True,
-            text=True,
-            shell=False,
-        )
-        duration_ms = round((time.perf_counter() - started_at) * 1000, 3)
+            return self._status(repo_path)
+        if action == "diff":
+            return self._diff(repo_path)
+        if action == "commit":
+            return self._commit(repo_path, parameters)
+        if action == "checkout":
+            return self._checkout(repo_path, parameters)
+        raise ValueError(f"Unsupported git action: {action}")
+
+    def _inspect(self, repo_path: Path) -> ToolResult:
+        command = ["git", "rev-parse", "--show-toplevel"]
+        completed = subprocess.run(command, cwd=str(repo_path), capture_output=True, text=True, shell=False)
+        return self._build_result(completed, repo_path, "inspect", {
+            "repo_path": str(repo_path),
+        })
+
+    def _status(self, repo_path: Path) -> ToolResult:
+        command = ["git", "status", "--short"]
+        completed = subprocess.run(command, cwd=str(repo_path), capture_output=True, text=True, shell=False)
+        return self._build_result(completed, repo_path, "status", {
+            "repo_path": str(repo_path),
+        })
+
+    def _diff(self, repo_path: Path) -> ToolResult:
+        command = ["git", "diff", "--", "."]
+        completed = subprocess.run(command, cwd=str(repo_path), capture_output=True, text=True, shell=False)
+        return self._build_result(completed, repo_path, "diff", {
+            "repo_path": str(repo_path),
+        })
+
+    def _commit(self, repo_path: Path, parameters: Dict[str, Any]) -> ToolResult:
+        files = parameters.get("files") or []
+        message = parameters.get("message") or "hermes commit"
+        if not isinstance(files, list) or not files:
+            raise ValueError("Git commit requires at least one file in 'files'")
+        add_command = ["git", "add", *files]
+        add_completed = subprocess.run(add_command, cwd=str(repo_path), capture_output=True, text=True, shell=False)
+        if add_completed.returncode != 0:
+            return self._build_result(add_completed, repo_path, "commit", {"files": files, "message": message})
+
+        command = ["git", "commit", "-m", message]
+        completed = subprocess.run(command, cwd=str(repo_path), capture_output=True, text=True, shell=False)
+        result = self._build_result(completed, repo_path, "commit", {"files": files, "message": message})
+        if completed.returncode == 0:
+            hash_completed = subprocess.run(["git", "rev-parse", "HEAD"], cwd=str(repo_path), capture_output=True, text=True, shell=False)
+            if hash_completed.returncode == 0:
+                result.data["commit_hash"] = hash_completed.stdout.strip()
+        return result
+
+    def _checkout(self, repo_path: Path, parameters: Dict[str, Any]) -> ToolResult:
+        branch = parameters.get("branch")
+        if not branch:
+            raise ValueError("Git checkout requires a 'branch' parameter")
+        existing = subprocess.run(["git", "rev-parse", "--verify", branch], cwd=str(repo_path), capture_output=True, text=True, shell=False)
+        if existing.returncode != 0:
+            create_completed = subprocess.run(["git", "checkout", "-b", branch], cwd=str(repo_path), capture_output=True, text=True, shell=False)
+            return self._build_result(create_completed, repo_path, "checkout", {"branch": branch})
+        checkout_completed = subprocess.run(["git", "checkout", branch], cwd=str(repo_path), capture_output=True, text=True, shell=False)
+        return self._build_result(checkout_completed, repo_path, "checkout", {"branch": branch})
+
+    def _build_result(self, completed: subprocess.CompletedProcess[str], repo_path: Path, action: str, metadata: Dict[str, Any]) -> ToolResult:
+        stdout = completed.stdout.strip()
+        stderr = completed.stderr.strip()
+        if action == "checkout" and not stdout and stderr:
+            stdout = stderr
+            stderr = ""
+
+        duration_ms = 0.0
         data = {
             "exit_code": completed.returncode,
-            "stdout": completed.stdout,
-            "stderr": completed.stderr,
+            "stdout": stdout,
+            "stderr": stderr,
             "succeeded": completed.returncode == 0,
             "duration_ms": duration_ms,
             "metadata": {
                 "action": action,
-                "repo_path": repo_path,
+                "repo_path": str(repo_path),
                 "allowed_actions": self.allowed_actions,
+                **metadata,
             },
         }
         return ToolResult(status="ok" if completed.returncode == 0 else "error", data=data)

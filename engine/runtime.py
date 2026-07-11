@@ -6,7 +6,9 @@ from typing import Any, Dict, List, Optional
 
 from .models import (
     Artifact,
+    CapabilityRequest,
     Event,
+    ExecutionContext,
     StepDefinition,
     StepExecution,
     Tool,
@@ -21,7 +23,7 @@ from .policy import PolicyDecision, PolicyEvaluator
 from .storage import SQLiteArtifactStore, SQLiteEventLog, SQLiteToolStore, SQLiteWorkflowDefinitionStore
 from .scheduler import Scheduler
 from .tools import ToolRegistry
-from .capability import CapabilityResolver
+from .capability import CapabilityRegistry, CapabilityResolver
 
 
 class RuntimeKernel:
@@ -42,6 +44,8 @@ class RuntimeKernel:
             self.artifact_store,
         )
         self.policy_evaluator = PolicyEvaluator()
+        self.capability_registry = CapabilityRegistry()
+        self.capability_registry.register_default_workers()
         self.tool_registry = ToolRegistry()
         self.tool_store = SQLiteToolStore(event_db_path.parent / "tools.db")
         self._load_definitions()
@@ -58,9 +62,44 @@ class RuntimeKernel:
 
     def _load_state(self) -> None:
         for event in self.event_log.all_events():
-            self._apply_event(event)
+            self._apply_event(event, replaying=True)
 
-    def _apply_event(self, event: Event) -> None:
+    def _resolve_workflow_execution_id(self, event: Event) -> Optional[str]:
+        payload = event.payload or {}
+        if event.event_type in {"WORKFLOW_CREATED", "WORKFLOW_COMPLETED", "WORKFLOW_FAILED", "APPROVAL_REQUIRED", "APPROVAL_GRANTED"}:
+            execution_id = payload.get("execution_id")
+            if execution_id is not None:
+                return execution_id
+        if event.execution_id in self.step_executions:
+            return self.step_executions[event.execution_id].workflow_id
+        workflow_execution_id = payload.get("workflow_execution_id")
+        if workflow_execution_id in self.workflow_executions:
+            return workflow_execution_id
+        return None
+
+    def _reconcile_workflow_state(self, workflow_execution_id: str) -> None:
+        workflow_execution = self.workflow_executions.get(workflow_execution_id)
+        if workflow_execution is None or workflow_execution.status in {"COMPLETED", "FAILED"}:
+            return
+
+        transition_action = self.scheduler.evaluate_workflow_transitions(workflow_execution_id)
+        if transition_action is None:
+            return
+
+        if transition_action["type"] == "require_approval":
+            if workflow_execution.status == "WAITING_APPROVAL":
+                return
+            if self.approval_already_granted(workflow_execution_id):
+                workflow_execution.status = "EXECUTING"
+                return
+            if any(
+                self.event_log.get(event_id) is not None and self.event_log.get(event_id).event_type == "APPROVAL_REQUIRED"
+                for event_id in workflow_execution.events
+            ):
+                return
+            self._emit_approval_required(workflow_execution_id, transition_action)
+
+    def _apply_event(self, event: Event, replaying: bool = False) -> None:
         if event.event_type == "WORKFLOW_CREATED":
             payload = event.payload
             workflow_status = payload.get("status", "PLANNING")
@@ -81,6 +120,7 @@ class RuntimeKernel:
                 produced_artifacts=[],
                 events=[event.event_id],
                 policy_context=payload.get("policy_context", {"approved": True, "policy_ids": []}),
+                execution_context=ExecutionContext.from_dict(payload.get("execution_context")),
             )
         elif event.event_type == "STEP_EXECUTION_CREATED":
             payload = event.payload
@@ -225,6 +265,11 @@ class RuntimeKernel:
             workflow_execution.completed_at = payload["completed_at"]
             workflow_execution.events.append(event.event_id)
 
+        if not replaying:
+            workflow_execution_id = self._resolve_workflow_execution_id(event)
+            if workflow_execution_id is not None:
+                self._reconcile_workflow_state(workflow_execution_id)
+
     def register_workflow_definition(self, workflow_definition: WorkflowDefinition) -> None:
         existing = self.workflow_definition_store.get(workflow_definition.workflow_definition_id)
         if existing is not None:
@@ -244,14 +289,21 @@ class RuntimeKernel:
             return
         self.tool_store.add(tool)
         self.tool_registry.register(tool)
+        self.capability_registry.register_tool(tool.tool_id, tool.to_dict())
 
-    def start_workflow(self, workflow_definition_id: str) -> str:
+    def start_workflow(
+        self,
+        workflow_definition_id: str,
+        execution_context: Optional[ExecutionContext] = None,
+    ) -> str:
         workflow_definition = self.workflow_definitions[workflow_definition_id]
+        execution_context = execution_context or ExecutionContext.default()
         workflow_execution = WorkflowExecution.create(
             workflow_id=workflow_definition.workflow_id,
             workflow_definition_id=workflow_definition.workflow_definition_id,
             definition_version=workflow_definition.definition_version,
             definition_hash=workflow_definition.compute_definition_hash(),
+            execution_context=execution_context,
         )
         event = Event.create(
             event_type="WORKFLOW_CREATED",
@@ -266,6 +318,7 @@ class RuntimeKernel:
                 "status": workflow_execution.status,
                 "started_at": workflow_execution.started_at,
                 "policy_context": workflow_execution.policy_context,
+                "execution_context": workflow_execution.execution_context.to_dict(),
             },
         )
         self.event_log.append(event)
@@ -524,15 +577,40 @@ class RuntimeKernel:
         resolved_capability = capability or execution.capability_required or step_definition.role
         resolved_objective = objective if objective is not None else step_definition.objective
 
+        execution_context_payload = None
+        if workflow_execution := self.workflow_executions.get(execution.workflow_id):
+            execution_context_payload = workflow_execution.execution_context.to_dict() if workflow_execution.execution_context else None
+
+        request = CapabilityRequest.from_dict({
+            "role": resolved_capability,
+            **(resolved_objective or {}),
+        })
+        if model_adapter is not None:
+            self.capability_registry.register_model_adapter(model_adapter)
+
+        required_worker = self.capability_registry.resolve_worker(request, execution_context=execution_context_payload)
         if worker_assigned is None:
-            worker_assigned = CapabilityResolver.resolve_worker_assignment(resolved_capability, resolved_objective)
+            worker_assigned = {
+                "worker_type": required_worker["worker_type"],
+                "worker_id": required_worker.get("worker_id"),
+                "capability": required_worker["role"],
+                "profile": {
+                    "role": required_worker["role"],
+                    "capabilities": required_worker.get("capabilities", []),
+                    "tool_support": required_worker.get("tool_support", False),
+                    "privacy_class": required_worker.get("privacy_class"),
+                },
+                "compatible": required_worker["compatible"],
+            }
+            if not required_worker["compatible"]:
+                self._emit_policy_failure(execution_id, "capability.no_compatible_worker")
+                return PolicyDecision(False, "capability.no_compatible_worker")
 
         if model_assigned is None:
-            resolved_model = CapabilityResolver.resolve_model_assignment(
-                resolved_capability,
-                resolved_objective,
-                model_adapter=model_adapter,
-            )
+            resolved_model = self.capability_registry.resolve_model(request, execution_context=execution_context_payload)
+            if model_adapter is not None and not resolved_model["compatible"]:
+                self._emit_policy_failure(execution_id, "capability.no_compatible_model")
+                return PolicyDecision(False, "capability.no_compatible_model")
             model_assigned = {
                 "capability": resolved_model["capability"],
                 "provider": resolved_model["provider"],
@@ -541,6 +619,10 @@ class RuntimeKernel:
                 "reason": resolved_model["reason"],
                 "profile": resolved_model["profile"],
             }
+
+        if execution_context_payload:
+            worker_assigned.setdefault("profile", {})["execution_context"] = dict(execution_context_payload)
+            model_assigned.setdefault("profile", {})["execution_context"] = dict(execution_context_payload)
 
         if model_adapter is not None and not model_assigned.get("compatible", True):
             self._emit_policy_failure(execution_id, "capability.model_not_compatible")

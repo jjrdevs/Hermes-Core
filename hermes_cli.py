@@ -287,6 +287,7 @@ def print_workflow_summary(kernel: RuntimeKernel, workflow_execution_id: str) ->
 
     print(f"Workflow execution: {workflow_execution.execution_id}")
     print(f"Workflow name: {workflow_name}")
+    print(f"State: {workflow_execution.status}")
     print(f"Status: {workflow_execution.status}")
     print(f"Started: {workflow_execution.started_at}")
     if workflow_execution.completed_at:
@@ -578,9 +579,9 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     list_parser = subparsers.add_parser("list", parents=[parent_parser], help="List persisted Hermes runtime resources")
     list_subparsers = list_parser.add_subparsers(dest="list_command", required=True)
-    list_subparsers.add_parser("workflows", help="List persisted workflow definitions")
-    list_subparsers.add_parser("executions", help="List persisted workflow executions")
-    list_subparsers.add_parser("tools", help="List persisted tools")
+    list_subparsers.add_parser("workflows", parents=[parent_parser], help="List persisted workflow definitions")
+    list_subparsers.add_parser("executions", parents=[parent_parser], help="List persisted workflow executions")
+    list_subparsers.add_parser("tools", parents=[parent_parser], help="List persisted tools")
 
     args = parser.parse_args(argv)
     try:

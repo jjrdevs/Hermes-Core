@@ -82,7 +82,15 @@ class Scheduler:
     def _transition_matches_event(self, transition: Dict[str, Any], event: Any) -> bool:
         condition = transition.get("condition", {})
         condition_event = condition.get("event")
-        if condition_event not in {event.event_type, "STEP_COMPLETED"}:
+        step_completion_aliases = {"STEP_COMPLETED", "STEP_EXECUTION_COMPLETED", "WORKER_COMPLETED"}
+
+        matches_event_type = condition_event == event.event_type
+        if not matches_event_type and condition_event == "STEP_COMPLETED":
+            matches_event_type = event.event_type in step_completion_aliases
+        elif not matches_event_type and event.event_type == "STEP_COMPLETED":
+            matches_event_type = condition_event in step_completion_aliases
+
+        if not matches_event_type:
             return False
 
         artifact_type = condition.get("artifact_type")
@@ -92,7 +100,7 @@ class Scheduler:
         if event.event_type == "ARTIFACT_CREATED":
             return artifact_type == event.payload.get("artifact_type")
 
-        if event.event_type == "STEP_EXECUTION_COMPLETED":
+        if event.event_type in {"STEP_EXECUTION_COMPLETED", "WORKER_COMPLETED", "STEP_COMPLETED"}:
             artifact_ids = event.payload.get("output_artifacts", [])
             for artifact_id in artifact_ids:
                 artifact = self.artifact_store.get(artifact_id)

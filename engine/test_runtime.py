@@ -5,7 +5,19 @@ from pathlib import Path
 
 import unittest.mock as mock
 
-from engine.models import Event, StepDefinition, Tool, ToolRequest, WorkflowDefinition, WorkerResponse, Artifact, _now_iso
+from engine.models import (
+    Artifact,
+    CapabilityRequest,
+    Event,
+    ExecutionContext,
+    StepDefinition,
+    Tool,
+    ToolRequest,
+    WorkflowDefinition,
+    WorkerResponse,
+    _now_iso,
+)
+from engine.capability import CapabilityRegistry
 from engine.runner import RuntimeRunner
 from engine.runtime import RuntimeKernel
 from workers.model_adapter import StubModelAdapter
@@ -43,6 +55,97 @@ class TestRuntimeRunner(unittest.TestCase):
             self.assertTrue(workflow_execution.produced_artifacts)
             self.assertEqual(len(runner.kernel.artifact_store.list()), 1)
             runner.shutdown()
+
+    def test_execution_context_persists_and_replays(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            event_db = Path(temp_dir) / "events.db"
+            artifact_db = Path(temp_dir) / "artifacts.db"
+            kernel = RuntimeKernel(event_db, artifact_db)
+
+            step = StepDefinition(
+                id="s1",
+                role="architect",
+                objective={"description": "architect"},
+                depends_on=[],
+                outputs=["artifact_a1"],
+                constraints={"allowed_tools": ["filesystem"]},
+            )
+            workflow_definition = WorkflowDefinition.create(
+                name="execution_context_workflow",
+                steps=[step],
+                transitions=[],
+                policy_refs=[],
+            )
+            execution_context = ExecutionContext(
+                execution_mode="interactive",
+                policy_profile="default",
+                sandbox_profile="standard",
+                approval_requirements={"human_confirm": True},
+                resource_constraints={"max_parallel_steps": 1},
+                environment_metadata={"workspace": "local"},
+            )
+            kernel.register_workflow_definition(workflow_definition)
+            workflow_execution_id = kernel.start_workflow(
+                workflow_definition.workflow_definition_id,
+                execution_context=execution_context,
+            )
+            kernel.shutdown()
+
+            recovered_kernel = RuntimeKernel(event_db, artifact_db)
+            recovered_execution = recovered_kernel.workflow_executions[workflow_execution_id]
+            self.assertEqual(recovered_execution.execution_context, execution_context)
+            created_event = next(
+                event for event in recovered_kernel.event_log.all_events() if event.event_type == "WORKFLOW_CREATED"
+            )
+            self.assertEqual(created_event.payload["execution_context"], execution_context.to_dict())
+            recovered_kernel.shutdown()
+
+    def test_assign_execution_receives_execution_context_in_capability_profile(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            event_db = Path(temp_dir) / "events.db"
+            artifact_db = Path(temp_dir) / "artifacts.db"
+            kernel = RuntimeKernel(event_db, artifact_db)
+
+            step = StepDefinition(
+                id="s1",
+                role="architect",
+                objective={"description": "architect"},
+                depends_on=[],
+                outputs=["artifact_a1"],
+                constraints={"allowed_tools": ["filesystem"]},
+            )
+            workflow_definition = WorkflowDefinition.create(
+                name="capability_context_workflow",
+                steps=[step],
+                transitions=[],
+                policy_refs=[],
+            )
+            execution_context = ExecutionContext(
+                execution_mode="autonomous",
+                policy_profile="default",
+                sandbox_profile="standard",
+                approval_requirements={"human_confirm": False},
+                resource_constraints={"max_parallel_steps": 3},
+                environment_metadata={"workspace": "local"},
+            )
+            kernel.register_workflow_definition(workflow_definition)
+            workflow_execution_id = kernel.start_workflow(
+                workflow_definition.workflow_definition_id,
+                execution_context=execution_context,
+            )
+            step_execution_id = kernel.schedule_next_step(workflow_execution_id)
+
+            decision = kernel.assign_execution(step_execution_id, model_adapter=StubModelAdapter())
+            self.assertTrue(decision.allowed)
+            assigned_event = next(
+                event for event in kernel.event_log.all_events() if event.event_type == "STEP_EXECUTION_ASSIGNED"
+            )
+
+            worker_profile = assigned_event.payload["worker_assigned"]["profile"]
+            model_profile = assigned_event.payload["model_assigned"]["profile"]
+            self.assertEqual(worker_profile["execution_context"], execution_context.to_dict())
+            self.assertEqual(model_profile["execution_context"], execution_context.to_dict())
+            kernel.shutdown()
 
     def test_runtime_kernel_recovers_definitions_and_events_on_restart(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -932,6 +1035,184 @@ class TestRuntimeRunner(unittest.TestCase):
             self.assertTrue(any(event.event_type == "STEP_EXECUTION_POLICY_DENIED" for event in kernel.event_log.all_events()))
             kernel.shutdown()
 
+    def test_git_tool_supports_diff_commit_and_checkout_flow(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            event_db = Path(temp_dir) / "events.db"
+            artifact_db = Path(temp_dir) / "artifacts.db"
+            kernel = RuntimeKernel(event_db, artifact_db)
+            repo_dir = Path(temp_dir) / "repo"
+            repo_dir.mkdir()
+            subprocess.run(["git", "init"], cwd=repo_dir, check=True, capture_output=True, text=True)
+            subprocess.run(["git", "config", "user.name", "Hermes Bot"], cwd=repo_dir, check=True, capture_output=True, text=True)
+            subprocess.run(["git", "config", "user.email", "hermes@example.com"], cwd=repo_dir, check=True, capture_output=True, text=True)
+            (repo_dir / "notes.txt").write_text("hello git", encoding="utf-8")
+            subprocess.run(["git", "add", "."], cwd=repo_dir, check=True, capture_output=True, text=True)
+            subprocess.run(["git", "commit", "-m", "initial commit"], cwd=repo_dir, check=True, capture_output=True, text=True)
+            (repo_dir / "notes.txt").write_text("hello git update", encoding="utf-8")
+
+            step = StepDefinition(
+                id="git-3",
+                role="developer",
+                objective={
+                    "description": "Inspect and update repository state",
+                    "required_capabilities": ["code", "reasoning"],
+                    "tool_support": True,
+                },
+                depends_on=[],
+                outputs=[],
+                constraints={"allowed_tools": ["git"]},
+            )
+            workflow_definition = WorkflowDefinition.create(
+                name="git_capability_workflow",
+                steps=[step],
+                transitions=[],
+                policy_refs=[],
+            )
+            kernel.register_workflow_definition(workflow_definition)
+            workflow_execution_id = kernel.start_workflow(workflow_definition.workflow_definition_id)
+            step_execution_id = kernel.schedule_next_step(workflow_execution_id)
+            kernel.assign_execution(
+                step_execution_id,
+                worker_assigned={"worker_type": step.role, "worker_id": "local-worker-1"},
+                model_assigned={"adapter": "local", "model_name": "stub-model"},
+            )
+            kernel.start_execution(step_execution_id)
+            tool = Tool(
+                tool_id="git",
+                name="Git Tool",
+                description="Inspect and mutate git repositories through Hermes",
+                actions=["status", "diff", "commit", "checkout", "inspect"],
+                allowed_roles=["developer"],
+                metadata={
+                    "kind": "git",
+                    "allowed_actions": ["status", "diff", "commit", "checkout", "inspect"],
+                    "capabilities": ["code", "reasoning", "tool_usage"],
+                    "tool_support": True,
+                },
+            )
+            kernel.register_tool(tool)
+
+            diff_decision = kernel.request_tool(step_execution_id, "git", "diff", {"repo_path": str(repo_dir)})
+            self.assertTrue(diff_decision.allowed)
+            diff_event = next(
+                event for event in kernel.event_log.all_events() if event.event_type == "TOOL_INVOKED" and event.payload["action"] == "diff"
+            )
+            self.assertEqual(diff_event.payload["result"]["status"], "ok")
+            self.assertIn("hello git update", diff_event.payload["result"]["data"]["stdout"])
+
+            commit_decision = kernel.request_tool(
+                step_execution_id,
+                "git",
+                "commit",
+                {
+                    "repo_path": str(repo_dir),
+                    "message": "update notes",
+                    "files": ["notes.txt"],
+                },
+            )
+            self.assertTrue(commit_decision.allowed)
+            commit_event = next(
+                event for event in kernel.event_log.all_events() if event.event_type == "TOOL_INVOKED" and event.payload["action"] == "commit"
+            )
+            self.assertEqual(commit_event.payload["result"]["status"], "ok")
+            self.assertIn("commit_hash", commit_event.payload["result"]["data"])
+
+            checkout_decision = kernel.request_tool(
+                step_execution_id,
+                "git",
+                "checkout",
+                {"repo_path": str(repo_dir), "branch": "feature/demo"},
+            )
+            self.assertTrue(checkout_decision.allowed)
+            checkout_event = next(
+                event for event in kernel.event_log.all_events() if event.event_type == "TOOL_INVOKED" and event.payload["action"] == "checkout"
+            )
+            self.assertEqual(checkout_event.payload["result"]["status"], "ok")
+            self.assertIn("feature/demo", checkout_event.payload["result"]["data"]["stdout"])
+            kernel.shutdown()
+
+    def test_git_tool_events_persist_across_runtime_recovery(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            event_db = Path(temp_dir) / "events.db"
+            artifact_db = Path(temp_dir) / "artifacts.db"
+            kernel = RuntimeKernel(event_db, artifact_db)
+            repo_dir = Path(temp_dir) / "repo"
+            repo_dir.mkdir()
+            subprocess.run(["git", "init"], cwd=repo_dir, check=True, capture_output=True, text=True)
+            subprocess.run(["git", "config", "user.name", "Hermes Bot"], cwd=repo_dir, check=True, capture_output=True, text=True)
+            subprocess.run(["git", "config", "user.email", "hermes@example.com"], cwd=repo_dir, check=True, capture_output=True, text=True)
+            (repo_dir / "notes.txt").write_text("hello git", encoding="utf-8")
+            subprocess.run(["git", "add", "."], cwd=repo_dir, check=True, capture_output=True, text=True)
+            subprocess.run(["git", "commit", "-m", "initial commit"], cwd=repo_dir, check=True, capture_output=True, text=True)
+
+            step = StepDefinition(
+                id="git-4",
+                role="developer",
+                objective={"description": "Inspect repository status", "required_capabilities": ["code", "reasoning"], "tool_support": True},
+                depends_on=[],
+                outputs=[],
+                constraints={"allowed_tools": ["git"]},
+            )
+            workflow_definition = WorkflowDefinition.create(
+                name="git_recovery_workflow",
+                steps=[step],
+                transitions=[],
+                policy_refs=[],
+            )
+            kernel.register_workflow_definition(workflow_definition)
+            workflow_execution_id = kernel.start_workflow(workflow_definition.workflow_definition_id)
+            step_execution_id = kernel.schedule_next_step(workflow_execution_id)
+            kernel.assign_execution(
+                step_execution_id,
+                worker_assigned={"worker_type": step.role, "worker_id": "local-worker-1"},
+                model_assigned={"adapter": "local", "model_name": "stub-model"},
+            )
+            kernel.start_execution(step_execution_id)
+            tool = Tool(
+                tool_id="git",
+                name="Git Tool",
+                description="Inspect git repositories",
+                actions=["status", "diff", "commit", "checkout", "inspect"],
+                allowed_roles=["developer"],
+                metadata={"kind": "git", "allowed_actions": ["status", "diff", "commit", "checkout", "inspect"]},
+            )
+            kernel.register_tool(tool)
+            decision = kernel.request_tool(step_execution_id, "git", "status", {"repo_path": str(repo_dir)})
+            self.assertTrue(decision.allowed)
+            kernel.shutdown()
+
+            recovered_kernel = RuntimeKernel(event_db, artifact_db)
+            invoke_events = [event for event in recovered_kernel.event_log.all_events() if event.event_type == "TOOL_INVOKED"]
+            self.assertEqual(len(invoke_events), 1)
+            self.assertEqual(invoke_events[0].payload["tool_id"], "git")
+            self.assertEqual(invoke_events[0].payload["action"], "status")
+            self.assertEqual(invoke_events[0].payload["result"]["status"], "ok")
+            recovered_kernel.shutdown()
+
+    def test_capability_registry_can_select_git_tool_from_capability_metadata(self):
+        registry = CapabilityRegistry()
+        registry.register_tool(
+            "git",
+            {
+                "kind": "git",
+                "tool_id": "git",
+                "capabilities": ["code", "reasoning", "tool_usage"],
+                "tool_support": True,
+                "allowed_actions": ["status", "diff", "commit", "checkout", "inspect"],
+            },
+        )
+        request = CapabilityRequest(
+            role="developer",
+            required_capabilities=["code", "reasoning"],
+            preferred_context_window=65536,
+            tool_support=True,
+            priority="high",
+        )
+
+        selection = registry.resolve_tool(request)
+        self.assertTrue(selection["compatible"])
+        self.assertEqual(selection["tool_id"], "git")
+
     def test_capability_resolution_assigns_worker_and_model_from_step_capability(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             event_db = Path(temp_dir) / "events.db"
@@ -965,6 +1246,107 @@ class TestRuntimeRunner(unittest.TestCase):
             self.assertTrue(assigned_event.payload["model_assigned"]["compatible"])
             self.assertEqual(assigned_event.payload["model_assigned"]["model_name"], "stub-model")
             kernel.shutdown()
+
+    def test_capability_registry_resolves_workers_and_models_deterministically(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            event_db = Path(temp_dir) / "events.db"
+            artifact_db = Path(temp_dir) / "artifacts.db"
+            kernel = RuntimeKernel(event_db, artifact_db)
+
+            request = CapabilityRequest(
+                role="developer",
+                required_capabilities=["code", "reasoning"],
+                preferred_context_window=65536,
+                tool_support=True,
+                priority="high",
+            )
+            kernel.capability_registry.register_worker(
+                "local-developer",
+                {
+                    "role": "developer",
+                    "worker_type": "developer",
+                    "capabilities": ["code", "reasoning"],
+                    "tool_support": True,
+                    "context_window": 65536,
+                    "privacy_class": "high",
+                },
+            )
+            kernel.capability_registry.register_worker(
+                "legacy-developer",
+                {
+                    "role": "developer",
+                    "worker_type": "developer",
+                    "capabilities": ["code"],
+                    "tool_support": False,
+                    "context_window": 16384,
+                    "privacy_class": "low",
+                },
+            )
+            kernel.capability_registry.register_model(
+                "stub-model",
+                {
+                    "name": "stub-model",
+                    "provider": "stub",
+                    "capabilities": {"code": True, "reasoning": True, "tool_use": True},
+                    "context_window": 65536,
+                    "latency_class": "low",
+                    "cost_class": "low",
+                    "privacy_class": "high",
+                },
+            )
+
+            first_worker = kernel.capability_registry.resolve_worker(request)
+            second_worker = kernel.capability_registry.resolve_worker(request)
+            model_assignment = kernel.capability_registry.resolve_model(request)
+
+            self.assertTrue(first_worker["compatible"])
+            self.assertEqual(first_worker, second_worker)
+            self.assertEqual(first_worker["worker_id"], "local-developer")
+            self.assertTrue(model_assignment["compatible"])
+            self.assertEqual(model_assignment["model_name"], "stub-model")
+            self.assertEqual(model_assignment["provider"], "stub")
+            kernel.shutdown()
+
+    def test_capability_registry_rejects_incompatible_workers_and_models(self):
+        registry = CapabilityRegistry()
+        request = CapabilityRequest(
+            role="developer",
+            required_capabilities=["code", "reasoning"],
+            preferred_context_window=65536,
+            tool_support=True,
+            priority="high",
+        )
+        registry.register_worker(
+            "incompatible-worker",
+            {
+                "role": "developer",
+                "worker_type": "developer",
+                "capabilities": ["code"],
+                "tool_support": False,
+                "context_window": 8192,
+                "privacy_class": "low",
+            },
+        )
+        registry.register_model(
+            "incompatible-model",
+            {
+                "name": "incompatible-model",
+                "provider": "stub",
+                "capabilities": {"code": True},
+                "context_window": 8192,
+                "latency_class": "low",
+                "cost_class": "low",
+                "privacy_class": "low",
+            },
+        )
+
+        worker_assignment = registry.resolve_worker(request)
+        model_assignment = registry.resolve_model(request)
+
+        self.assertFalse(worker_assignment["compatible"])
+        self.assertEqual(worker_assignment["reason"], "no_compatible_worker")
+        self.assertFalse(model_assignment["compatible"])
+        self.assertEqual(model_assignment["reason"], ["no_compatible_model"])
 
     def test_require_approval_transition_moves_workflow_to_waiting_approval(self):
         with tempfile.TemporaryDirectory() as temp_dir:

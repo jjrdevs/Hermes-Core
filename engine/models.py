@@ -34,6 +34,85 @@ class Event:
 
 
 @dataclasses.dataclass(frozen=True)
+class CapabilityRequest:
+    role: str
+    required_capabilities: List[str] = dataclasses.field(default_factory=list)
+    preferred_context_window: Optional[int] = None
+    tool_support: Optional[bool] = None
+    priority: str = "normal"
+    latency_class: Optional[str] = None
+    cost_class: Optional[str] = None
+    privacy_class: Optional[str] = None
+    function_support: Optional[bool] = None
+
+    @classmethod
+    def from_dict(cls, data: Optional[Dict[str, Any]]) -> "CapabilityRequest":
+        if not data:
+            return cls(role="developer")
+        return cls(
+            role=data.get("role", "developer"),
+            required_capabilities=list(data.get("required_capabilities", []) or []),
+            preferred_context_window=data.get("preferred_context_window"),
+            tool_support=data.get("tool_support"),
+            priority=data.get("priority", "normal"),
+            latency_class=data.get("latency_class"),
+            cost_class=data.get("cost_class"),
+            privacy_class=data.get("privacy_class"),
+            function_support=data.get("function_support"),
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "role": self.role,
+            "required_capabilities": list(self.required_capabilities),
+            "preferred_context_window": self.preferred_context_window,
+            "tool_support": self.tool_support,
+            "priority": self.priority,
+            "latency_class": self.latency_class,
+            "cost_class": self.cost_class,
+            "privacy_class": self.privacy_class,
+            "function_support": self.function_support,
+        }
+
+
+@dataclasses.dataclass(frozen=True)
+class ExecutionContext:
+    execution_mode: str = "autonomous"
+    policy_profile: str = "default"
+    sandbox_profile: str = "standard"
+    approval_requirements: Dict[str, Any] = dataclasses.field(default_factory=dict)
+    resource_constraints: Dict[str, Any] = dataclasses.field(default_factory=dict)
+    environment_metadata: Dict[str, Any] = dataclasses.field(default_factory=dict)
+
+    @staticmethod
+    def default() -> "ExecutionContext":
+        return ExecutionContext()
+
+    @classmethod
+    def from_dict(cls, data: Optional[Dict[str, Any]]) -> "ExecutionContext":
+        if not data:
+            return cls.default()
+        return cls(
+            execution_mode=data.get("execution_mode", "autonomous"),
+            policy_profile=data.get("policy_profile", "default"),
+            sandbox_profile=data.get("sandbox_profile", "standard"),
+            approval_requirements=data.get("approval_requirements", {}),
+            resource_constraints=data.get("resource_constraints", {}),
+            environment_metadata=data.get("environment_metadata", {}),
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "execution_mode": self.execution_mode,
+            "policy_profile": self.policy_profile,
+            "sandbox_profile": self.sandbox_profile,
+            "approval_requirements": self.approval_requirements,
+            "resource_constraints": self.resource_constraints,
+            "environment_metadata": self.environment_metadata,
+        }
+
+
+@dataclasses.dataclass(frozen=True)
 class Artifact:
     artifact_id: str
     artifact_type: str
@@ -261,9 +340,16 @@ class WorkflowExecution:
     produced_artifacts: List[str]
     events: List[str]
     policy_context: Dict[str, Any]
+    execution_context: Optional[ExecutionContext] = None
 
     @staticmethod
-    def create(workflow_id: str, workflow_definition_id: str, definition_version: int, definition_hash: str) -> "WorkflowExecution":
+    def create(
+        workflow_id: str,
+        workflow_definition_id: str,
+        definition_version: int,
+        definition_hash: str,
+        execution_context: Optional[ExecutionContext] = None,
+    ) -> "WorkflowExecution":
         return WorkflowExecution(
             execution_id=str(uuid.uuid4()),
             workflow_id=workflow_id,
@@ -279,6 +365,7 @@ class WorkflowExecution:
             produced_artifacts=[],
             events=[],
             policy_context={"approved": True, "policy_ids": []},
+            execution_context=execution_context or ExecutionContext.default(),
         )
 
 

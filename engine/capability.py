@@ -1,17 +1,248 @@
 from __future__ import annotations
 
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
+
+from .models import CapabilityRequest
 
 
 class CapabilityRegistry:
     def __init__(self, profiles: Optional[Dict[str, Dict[str, Any]]] = None) -> None:
         self._profiles = dict(profiles or {})
+        self._workers: Dict[str, Dict[str, Any]] = {}
+        self._models: Dict[str, Dict[str, Any]] = {}
+        self._tools: Dict[str, Dict[str, Any]] = {}
 
     def register(self, capability: str, profile: Dict[str, Any]) -> None:
         self._profiles[capability] = profile
 
     def get(self, capability: str) -> Dict[str, Any]:
         return dict(self._profiles.get(capability, {}))
+
+    def register_default_workers(self) -> None:
+        self.register_worker(
+            "local-worker-1",
+            {
+                "role": "developer",
+                "worker_type": "developer",
+                "capabilities": ["code", "reasoning"],
+                "tool_support": True,
+                "context_window": 65536,
+                "privacy_class": "high",
+            },
+        )
+        self.register_worker(
+            "local-worker-2",
+            {
+                "role": "architect",
+                "worker_type": "architect",
+                "capabilities": ["planning", "reasoning"],
+                "tool_support": True,
+                "context_window": 65536,
+                "privacy_class": "high",
+            },
+        )
+        self.register_worker(
+            "local-worker-3",
+            {
+                "role": "researcher",
+                "worker_type": "researcher",
+                "capabilities": ["reasoning", "analysis"],
+                "tool_support": False,
+                "context_window": 32768,
+                "privacy_class": "medium",
+            },
+        )
+
+    def register_worker(self, worker_id: str, metadata: Dict[str, Any]) -> None:
+        self._workers[worker_id] = dict(metadata)
+
+    def register_model(self, model_id: str, metadata: Dict[str, Any]) -> None:
+        self._models[model_id] = dict(metadata)
+
+    def register_tool(self, tool_id: str, metadata: Dict[str, Any]) -> None:
+        self._tools[tool_id] = dict(metadata)
+
+    def register_model_adapter(self, model_adapter: Any) -> None:
+        if not hasattr(model_adapter, "capabilities"):
+            return
+        capabilities = model_adapter.capabilities() if callable(model_adapter.capabilities) else model_adapter.capabilities
+        adapter_metadata = dict(capabilities)
+        model_name = adapter_metadata.get("name", "stub-model")
+        self.register_model(model_name, adapter_metadata)
+
+    def resolve_worker(self, request: CapabilityRequest, execution_context: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        candidate_workers: List[Dict[str, Any]] = []
+        for worker_id, metadata in sorted(self._workers.items()):
+            worker_type = metadata.get("worker_type", metadata.get("role"))
+            capabilities = set(metadata.get("capabilities", []) or [])
+            required = set(request.required_capabilities)
+            if not required.issubset(capabilities):
+                continue
+            if request.tool_support is not None and bool(metadata.get("tool_support", False)) != bool(request.tool_support):
+                continue
+            preferred_context_window = request.preferred_context_window
+            context_window = metadata.get("context_window")
+            if preferred_context_window is not None and context_window is not None and context_window < preferred_context_window:
+                continue
+            if execution_context is not None:
+                privacy_class = execution_context.get("privacy_class")
+                if privacy_class is not None and metadata.get("privacy_class") not in {privacy_class, None}:
+                    if metadata.get("privacy_class") == "low" and privacy_class == "high":
+                        continue
+            candidate_workers.append(
+                {
+                    "worker_id": worker_id,
+                    "worker_type": worker_type,
+                    "role": metadata.get("role", worker_type),
+                    "capabilities": sorted(capabilities),
+                    "compatible": True,
+                    "privacy_class": metadata.get("privacy_class"),
+                    "tool_support": bool(metadata.get("tool_support", False)),
+                    "priority": request.priority,
+                }
+            )
+
+        if not candidate_workers:
+            return {
+                "worker_id": None,
+                "worker_type": request.role,
+                "role": request.role,
+                "capabilities": sorted(set(request.required_capabilities)),
+                "compatible": False,
+                "reason": "no_compatible_worker",
+                "priority": request.priority,
+            }
+
+        candidate_workers.sort(key=lambda item: (
+            -int(bool(item.get("tool_support"))),
+            -int(item.get("privacy_class") == "high"),
+            -int(item.get("priority") == "high"),
+            item.get("worker_id", ""),
+        ))
+        return candidate_workers[0]
+
+    def resolve_tool(self, request: CapabilityRequest, execution_context: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        candidate_tools: List[Dict[str, Any]] = []
+        for tool_id, metadata in sorted(self._tools.items()):
+            tool_capabilities = set(metadata.get("capabilities", []) or [])
+            required = set(request.required_capabilities)
+            if not required.issubset(tool_capabilities):
+                continue
+            if request.tool_support is not None and bool(metadata.get("tool_support", False)) != bool(request.tool_support):
+                continue
+            if execution_context is not None:
+                privacy_class = execution_context.get("privacy_class")
+                if privacy_class is not None and metadata.get("privacy_class") not in {privacy_class, None}:
+                    if metadata.get("privacy_class") == "low" and privacy_class == "high":
+                        continue
+            candidate_tools.append(
+                {
+                    "tool_id": tool_id,
+                    "tool_name": metadata.get("name", tool_id),
+                    "compatible": True,
+                    "capabilities": sorted(tool_capabilities),
+                    "allowed_actions": list(metadata.get("allowed_actions", []) or []),
+                    "tool_support": bool(metadata.get("tool_support", False)),
+                    "profile": {
+                        "required_features": list(required),
+                        "preferred_context_window": request.preferred_context_window,
+                        "requires_tool_support": bool(request.tool_support),
+                        "privacy_class": metadata.get("privacy_class"),
+                    },
+                }
+            )
+
+        if not candidate_tools:
+            return {
+                "tool_id": None,
+                "tool_name": None,
+                "compatible": False,
+                "capabilities": sorted(set(request.required_capabilities)),
+                "allowed_actions": [],
+                "tool_support": bool(request.tool_support),
+                "profile": {
+                    "required_features": list(set(request.required_capabilities)),
+                    "preferred_context_window": request.preferred_context_window,
+                    "requires_tool_support": bool(request.tool_support),
+                    "privacy_class": request.privacy_class,
+                },
+            }
+
+        candidate_tools.sort(key=lambda item: (
+            -int(bool(item.get("tool_support"))),
+            -int(item.get("profile", {}).get("privacy_class") == "high"),
+            item.get("tool_id", ""),
+        ))
+        return candidate_tools[0]
+
+    def resolve_model(self, request: CapabilityRequest, execution_context: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        candidate_models: List[Dict[str, Any]] = []
+        for model_id, metadata in sorted(self._models.items()):
+            adapter_capabilities = metadata.get("capabilities", {}) or {}
+            if not isinstance(adapter_capabilities, dict):
+                continue
+            required = set(request.required_capabilities)
+            available = set(adapter_capabilities.keys())
+            if not required.issubset(available):
+                continue
+            if request.tool_support is not None and bool(adapter_capabilities.get("tool_use", False)) != bool(request.tool_support):
+                continue
+            preferred_context_window = request.preferred_context_window
+            context_window = metadata.get("context_window")
+            if preferred_context_window is not None and context_window is not None and context_window < preferred_context_window:
+                continue
+            if execution_context is not None:
+                privacy_class = execution_context.get("privacy_class")
+                if privacy_class is not None and metadata.get("privacy_class") not in {privacy_class, None}:
+                    if metadata.get("privacy_class") == "low" and privacy_class == "high":
+                        continue
+            compatible = True
+            candidate_models.append(
+                {
+                    "model_id": model_id,
+                    "model_name": metadata.get("name", model_id),
+                    "provider": metadata.get("provider", "stub"),
+                    "capability": request.role,
+                    "compatible": compatible,
+                    "reason": [],
+                    "profile": {
+                        "required_features": list(required),
+                        "preferred_context_window": preferred_context_window,
+                        "requires_tool_support": bool(request.tool_support),
+                        "latency_class": metadata.get("latency_class"),
+                        "cost_class": metadata.get("cost_class"),
+                        "privacy_class": metadata.get("privacy_class"),
+                    },
+                    "adapter_capabilities": metadata,
+                }
+            )
+
+        if not candidate_models:
+            return {
+                "model_id": None,
+                "model_name": None,
+                "provider": None,
+                "capability": request.role,
+                "compatible": False,
+                "reason": ["no_compatible_model"],
+                "profile": {
+                    "required_features": list(set(request.required_capabilities)),
+                    "preferred_context_window": request.preferred_context_window,
+                    "requires_tool_support": bool(request.tool_support),
+                    "latency_class": request.latency_class,
+                    "cost_class": request.cost_class,
+                    "privacy_class": request.privacy_class,
+                },
+                "adapter_capabilities": {},
+            }
+
+        candidate_models.sort(key=lambda item: (
+            -int(item.get("profile", {}).get("requires_tool_support", False)),
+            -int(item.get("profile", {}).get("privacy_class") == "high"),
+            -int(item.get("profile", {}).get("cost_class") == "low"),
+            item.get("model_id", ""),
+        ))
+        return candidate_models[0]
 
 
 class CapabilityResolver:
@@ -97,11 +328,19 @@ class CapabilityResolver:
         return profile
 
     @classmethod
-    def resolve_worker_assignment(cls, capability: str, objective: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    def resolve_worker_assignment(
+        cls,
+        capability: str,
+        objective: Optional[Dict[str, Any]] = None,
+        execution_context: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        profile = cls.get_profile(capability, objective)
+        if execution_context:
+            profile["execution_context"] = dict(execution_context)
         return {
             "worker_type": capability,
             "capability": capability,
-            "profile": cls.get_profile(capability, objective),
+            "profile": profile,
         }
 
     @classmethod
@@ -110,11 +349,15 @@ class CapabilityResolver:
         capability: str,
         objective: Optional[Dict[str, Any]] = None,
         model_adapter: Optional[Any] = None,
+        execution_context: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         profile = cls.get_profile(capability, objective)
         adapter_capabilities = {}
         compatible = True
         reasons: list[str] = []
+
+        if execution_context:
+            profile["execution_context"] = dict(execution_context)
 
         if model_adapter is not None:
             adapter_capabilities = model_adapter.capabilities() if hasattr(model_adapter, "capabilities") else {}
