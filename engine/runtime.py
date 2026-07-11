@@ -10,6 +10,7 @@ from .models import (
     StepDefinition,
     StepExecution,
     Tool,
+    ToolRequest,
     WorkflowDefinition,
     WorkflowExecution,
     WorkerRequest,
@@ -20,6 +21,7 @@ from .policy import PolicyDecision, PolicyEvaluator
 from .storage import SQLiteArtifactStore, SQLiteEventLog, SQLiteToolStore, SQLiteWorkflowDefinitionStore
 from .scheduler import Scheduler
 from .tools import ToolRegistry
+from .capability import CapabilityResolver
 
 
 class RuntimeKernel:
@@ -112,6 +114,8 @@ class RuntimeKernel:
             workflow_execution = self.workflow_executions[execution.workflow_id]
             if workflow_execution.status in {"PLANNING", "CREATED"}:
                 workflow_execution.status = "EXECUTING"
+            elif workflow_execution.status == "WAITING_APPROVAL":
+                workflow_execution.status = "WAITING_APPROVAL"
             workflow_execution.events.append(event.event_id)
         elif event.event_type in {"STEP_EXECUTION_ASSIGNED", "WORKER_ASSIGNED"}:
             payload = event.payload
@@ -278,9 +282,8 @@ class RuntimeKernel:
             if transition_action["type"] == "require_approval":
                 if self.approval_already_granted(workflow_execution_id):
                     pass
-                elif workflow_execution.status != "WAITING_APPROVAL":
-                    self._emit_approval_required(workflow_execution_id, transition_action)
                 else:
+                    self._emit_approval_required(workflow_execution_id, transition_action)
                     return None
             if transition_action["type"] == "no_action":
                 return None
@@ -502,11 +505,47 @@ class RuntimeKernel:
         self.event_log.append(event)
         self._apply_event(event)
 
-    def assign_execution(self, execution_id: str, worker_assigned: Dict[str, Any], model_assigned: Dict[str, Any]) -> PolicyDecision:
+    def assign_execution(
+        self,
+        execution_id: str,
+        worker_assigned: Optional[Dict[str, Any]] = None,
+        model_assigned: Optional[Dict[str, Any]] = None,
+        *,
+        model_adapter: Optional[Any] = None,
+        capability: Optional[str] = None,
+        objective: Optional[Dict[str, Any]] = None,
+    ) -> PolicyDecision:
         decision = self._evaluate_execution_policy(execution_id, "assign_step")
         if not decision.allowed:
             return decision
+
         execution = self.step_executions[execution_id]
+        step_definition = self._get_step_definition(execution_id)
+        resolved_capability = capability or execution.capability_required or step_definition.role
+        resolved_objective = objective if objective is not None else step_definition.objective
+
+        if worker_assigned is None:
+            worker_assigned = CapabilityResolver.resolve_worker_assignment(resolved_capability, resolved_objective)
+
+        if model_assigned is None:
+            resolved_model = CapabilityResolver.resolve_model_assignment(
+                resolved_capability,
+                resolved_objective,
+                model_adapter=model_adapter,
+            )
+            model_assigned = {
+                "capability": resolved_model["capability"],
+                "provider": resolved_model["provider"],
+                "model_name": resolved_model["model_name"],
+                "compatible": resolved_model["compatible"],
+                "reason": resolved_model["reason"],
+                "profile": resolved_model["profile"],
+            }
+
+        if model_adapter is not None and not model_assigned.get("compatible", True):
+            self._emit_policy_failure(execution_id, "capability.model_not_compatible")
+            return PolicyDecision(False, "capability.model_not_compatible")
+
         event = Event.create(
             event_type="STEP_EXECUTION_ASSIGNED",
             workflow_id=execution.workflow_id,
@@ -525,10 +564,20 @@ class RuntimeKernel:
         execution = self.step_executions[execution_id]
         workflow_execution = self.workflow_executions[execution.workflow_id]
         step_definition = self._get_step_definition(execution_id)
+        tool = self.tool_registry.get(tool_id)
+        if tool is None:
+            self._emit_tool_failed(execution_id, tool_id, action, "tool_registry.tool_not_found")
+            return PolicyDecision(False, "tool_registry.tool_not_found")
+
         policy_context = {
             "tool_id": tool_id,
             "tool_action": action,
             "policy_context": execution.policy_context,
+            "tool_constraints": {
+                "command": parameters.get("command"),
+                "allowed_commands": (tool.metadata or {}).get("allowed_commands", []),
+                "allowed_actions": (tool.metadata or {}).get("allowed_actions", []),
+            },
         }
         decision = self._evaluate_execution_policy(
             execution_id,
@@ -542,11 +591,6 @@ class RuntimeKernel:
         if not self.tool_registry.authorize(execution.capability_required, tool_id, action):
             self._emit_tool_failed(execution_id, tool_id, action, "tool_registry.unauthorized")
             return PolicyDecision(False, "tool_registry.unauthorized")
-
-        tool = self.tool_registry.get(tool_id)
-        if tool is None:
-            self._emit_tool_failed(execution_id, tool_id, action, "tool_registry.tool_not_found")
-            return PolicyDecision(False, "tool_registry.tool_not_found")
 
         request_event = Event.create(
             event_type="TOOL_REQUESTED",
@@ -568,6 +612,26 @@ class RuntimeKernel:
         self.event_log.append(request_event)
         self._apply_event(request_event)
 
+        result = None
+        try:
+            from .tool_runtime import FilesystemTool, GitTool, ShellTool
+
+            tool_runtime = None
+            metadata = tool.metadata or {}
+            if tool_id == "filesystem":
+                tool_runtime = FilesystemTool(allowed_roots=metadata.get("allowed_roots", []), metadata=metadata)
+            elif tool_id == "shell":
+                tool_runtime = ShellTool(allowed_commands=metadata.get("allowed_commands", []), metadata=metadata)
+            elif tool_id == "git":
+                tool_runtime = GitTool(allowed_actions=metadata.get("allowed_actions", []), metadata=metadata)
+            if tool_runtime is None:
+                raise ValueError(f"No runtime implementation for tool '{tool_id}'")
+            tool_request = ToolRequest(tool_id=tool_id, action=action, parameters=parameters)
+            result = tool_runtime.execute(tool_request)
+        except Exception as exc:
+            self._emit_tool_failed(execution_id, tool_id, action, str(exc))
+            return PolicyDecision(False, str(exc))
+
         invoke_event = Event.create(
             event_type="TOOL_INVOKED",
             workflow_id=workflow_execution.workflow_id,
@@ -582,7 +646,7 @@ class RuntimeKernel:
                     "allowed": decision.allowed,
                     "reason": decision.reason,
                 },
-                "result": {"status": "accepted"},
+                "result": result.to_dict(),
             },
         )
         self.event_log.append(invoke_event)

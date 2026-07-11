@@ -1,3 +1,4 @@
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -7,6 +8,7 @@ import unittest.mock as mock
 from engine.models import Event, StepDefinition, Tool, ToolRequest, WorkflowDefinition, WorkerResponse, Artifact, _now_iso
 from engine.runner import RuntimeRunner
 from engine.runtime import RuntimeKernel
+from workers.model_adapter import StubModelAdapter
 
 
 class TestRuntimeRunner(unittest.TestCase):
@@ -588,6 +590,380 @@ class TestRuntimeRunner(unittest.TestCase):
             )
             kernel.start_execution(step_execution_id)
             self.assertEqual(kernel.get_workflow_status(workflow_execution_id), "EXECUTING")
+            kernel.shutdown()
+
+    def test_tool_request_executes_filesystem_tool_and_records_result(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            event_db = Path(temp_dir) / "events.db"
+            artifact_db = Path(temp_dir) / "artifacts.db"
+            kernel = RuntimeKernel(event_db, artifact_db)
+            workspace_dir = Path(temp_dir) / "workspace"
+            workspace_dir.mkdir()
+            target_path = workspace_dir / "notes.txt"
+            target_path.write_text("hello hermes", encoding="utf-8")
+
+            step = StepDefinition(
+                id="architect-1",
+                role="architect",
+                objective={"description": "Inspect workspace"},
+                depends_on=[],
+                outputs=[],
+                constraints={"allowed_tools": ["filesystem"]},
+            )
+            workflow_definition = WorkflowDefinition.create(
+                name="filesystem_tool_workflow",
+                steps=[step],
+                transitions=[],
+                policy_refs=[],
+            )
+            kernel.register_workflow_definition(workflow_definition)
+            workflow_execution_id = kernel.start_workflow(workflow_definition.workflow_definition_id)
+            step_execution_id = kernel.schedule_next_step(workflow_execution_id)
+            kernel.assign_execution(
+                step_execution_id,
+                worker_assigned={"worker_type": step.role, "worker_id": "local-worker-1"},
+                model_assigned={"adapter": "local", "model_name": "stub-model"},
+            )
+            kernel.start_execution(step_execution_id)
+
+            tool = Tool(
+                tool_id="filesystem",
+                name="Filesystem Tool",
+                description="Access files",
+                actions=["read", "write"],
+                allowed_roles=["architect"],
+                metadata={"kind": "filesystem", "allowed_roots": [str(workspace_dir)]},
+            )
+            kernel.register_tool(tool)
+
+            decision = kernel.request_tool(step_execution_id, "filesystem", "read", {"path": str(target_path)})
+            self.assertTrue(decision.allowed)
+            invoke_event = next(event for event in kernel.event_log.all_events() if event.event_type == "TOOL_INVOKED")
+            self.assertEqual(invoke_event.payload["result"]["status"], "ok")
+            self.assertEqual(invoke_event.payload["result"]["data"]["content"], "hello hermes")
+            kernel.shutdown()
+
+    def test_shell_tool_executes_authorized_command_and_records_metadata(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            event_db = Path(temp_dir) / "events.db"
+            artifact_db = Path(temp_dir) / "artifacts.db"
+            kernel = RuntimeKernel(event_db, artifact_db)
+
+            step = StepDefinition(
+                id="shell-1",
+                role="architect",
+                objective={"description": "Run a validation command"},
+                depends_on=[],
+                outputs=[],
+                constraints={"allowed_tools": ["shell"]},
+            )
+            workflow_definition = WorkflowDefinition.create(
+                name="shell_tool_workflow",
+                steps=[step],
+                transitions=[],
+                policy_refs=[],
+            )
+            kernel.register_workflow_definition(workflow_definition)
+            workflow_execution_id = kernel.start_workflow(workflow_definition.workflow_definition_id)
+            step_execution_id = kernel.schedule_next_step(workflow_execution_id)
+            kernel.assign_execution(
+                step_execution_id,
+                worker_assigned={"worker_type": step.role, "worker_id": "local-worker-1"},
+                model_assigned={"adapter": "local", "model_name": "stub-model"},
+            )
+            kernel.start_execution(step_execution_id)
+            tool = Tool(
+                tool_id="shell",
+                name="Shell Tool",
+                description="Run shell commands",
+                actions=["exec"],
+                allowed_roles=["architect"],
+                metadata={"kind": "shell", "allowed_commands": ["python"]},
+            )
+            kernel.register_tool(tool)
+
+            decision = kernel.request_tool(
+                step_execution_id,
+                "shell",
+                "exec",
+                {"command": ["python", "-c", "print('hello-shell')"]},
+            )
+            self.assertTrue(decision.allowed)
+            invoke_event = next(event for event in kernel.event_log.all_events() if event.event_type == "TOOL_INVOKED")
+            self.assertEqual(invoke_event.payload["result"]["status"], "ok")
+            self.assertEqual(invoke_event.payload["result"]["data"]["exit_code"], 0)
+            self.assertIn("hello-shell", invoke_event.payload["result"]["data"]["stdout"])
+            self.assertEqual(invoke_event.payload["result"]["data"]["metadata"]["command"], ["python", "-c", "print('hello-shell')"])
+            kernel.shutdown()
+
+    def test_shell_tool_rejects_unauthorized_command_via_policy(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            event_db = Path(temp_dir) / "events.db"
+            artifact_db = Path(temp_dir) / "artifacts.db"
+            kernel = RuntimeKernel(event_db, artifact_db)
+
+            step = StepDefinition(
+                id="shell-2",
+                role="architect",
+                objective={"description": "Run a blocked command"},
+                depends_on=[],
+                outputs=[],
+                constraints={"allowed_tools": ["shell"]},
+            )
+            workflow_definition = WorkflowDefinition.create(
+                name="blocked_shell_tool_workflow",
+                steps=[step],
+                transitions=[],
+                policy_refs=[],
+            )
+            kernel.register_workflow_definition(workflow_definition)
+            workflow_execution_id = kernel.start_workflow(workflow_definition.workflow_definition_id)
+            step_execution_id = kernel.schedule_next_step(workflow_execution_id)
+            kernel.assign_execution(
+                step_execution_id,
+                worker_assigned={"worker_type": step.role, "worker_id": "local-worker-1"},
+                model_assigned={"adapter": "local", "model_name": "stub-model"},
+            )
+            kernel.start_execution(step_execution_id)
+            tool = Tool(
+                tool_id="shell",
+                name="Shell Tool",
+                description="Run shell commands",
+                actions=["exec"],
+                allowed_roles=["architect"],
+                metadata={"kind": "shell", "allowed_commands": ["python"]},
+            )
+            kernel.register_tool(tool)
+
+            decision = kernel.request_tool(step_execution_id, "shell", "exec", {"command": ["pytest", "-q"]})
+            self.assertFalse(decision.allowed)
+            self.assertEqual(decision.reason, "tool_constraints.command_not_allowed")
+            self.assertTrue(any(event.event_type == "STEP_EXECUTION_POLICY_DENIED" for event in kernel.event_log.all_events()))
+            kernel.shutdown()
+
+    def test_shell_tool_records_non_zero_exit_codes(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            event_db = Path(temp_dir) / "events.db"
+            artifact_db = Path(temp_dir) / "artifacts.db"
+            kernel = RuntimeKernel(event_db, artifact_db)
+
+            step = StepDefinition(
+                id="shell-3",
+                role="architect",
+                objective={"description": "Run a failing command"},
+                depends_on=[],
+                outputs=[],
+                constraints={"allowed_tools": ["shell"]},
+            )
+            workflow_definition = WorkflowDefinition.create(
+                name="failing_shell_tool_workflow",
+                steps=[step],
+                transitions=[],
+                policy_refs=[],
+            )
+            kernel.register_workflow_definition(workflow_definition)
+            workflow_execution_id = kernel.start_workflow(workflow_definition.workflow_definition_id)
+            step_execution_id = kernel.schedule_next_step(workflow_execution_id)
+            kernel.assign_execution(
+                step_execution_id,
+                worker_assigned={"worker_type": step.role, "worker_id": "local-worker-1"},
+                model_assigned={"adapter": "local", "model_name": "stub-model"},
+            )
+            kernel.start_execution(step_execution_id)
+            tool = Tool(
+                tool_id="shell",
+                name="Shell Tool",
+                description="Run shell commands",
+                actions=["exec"],
+                allowed_roles=["architect"],
+                metadata={"kind": "shell", "allowed_commands": ["python"]},
+            )
+            kernel.register_tool(tool)
+
+            decision = kernel.request_tool(step_execution_id, "shell", "exec", {"command": ["python", "-c", "import sys; sys.exit(7)"]})
+            self.assertTrue(decision.allowed)
+            invoke_event = next(event for event in kernel.event_log.all_events() if event.event_type == "TOOL_INVOKED")
+            self.assertEqual(invoke_event.payload["result"]["status"], "error")
+            self.assertEqual(invoke_event.payload["result"]["data"]["exit_code"], 7)
+            self.assertFalse(invoke_event.payload["result"]["data"]["succeeded"])
+            kernel.shutdown()
+
+    def test_shell_tool_events_persist_across_runtime_recovery(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            event_db = Path(temp_dir) / "events.db"
+            artifact_db = Path(temp_dir) / "artifacts.db"
+            kernel = RuntimeKernel(event_db, artifact_db)
+
+            step = StepDefinition(
+                id="shell-4",
+                role="architect",
+                objective={"description": "Run a persisted shell command"},
+                depends_on=[],
+                outputs=[],
+                constraints={"allowed_tools": ["shell"]},
+            )
+            workflow_definition = WorkflowDefinition.create(
+                name="shell_recovery_workflow",
+                steps=[step],
+                transitions=[],
+                policy_refs=[],
+            )
+            kernel.register_workflow_definition(workflow_definition)
+            workflow_execution_id = kernel.start_workflow(workflow_definition.workflow_definition_id)
+            step_execution_id = kernel.schedule_next_step(workflow_execution_id)
+            kernel.assign_execution(
+                step_execution_id,
+                worker_assigned={"worker_type": step.role, "worker_id": "local-worker-1"},
+                model_assigned={"adapter": "local", "model_name": "stub-model"},
+            )
+            kernel.start_execution(step_execution_id)
+            tool = Tool(
+                tool_id="shell",
+                name="Shell Tool",
+                description="Run shell commands",
+                actions=["exec"],
+                allowed_roles=["architect"],
+                metadata={"kind": "shell", "allowed_commands": ["python"]},
+            )
+            kernel.register_tool(tool)
+            kernel.request_tool(step_execution_id, "shell", "exec", {"command": ["python", "-c", "print('recovered')"]})
+            kernel.shutdown()
+
+            recovered_kernel = RuntimeKernel(event_db, artifact_db)
+            invoke_events = [event for event in recovered_kernel.event_log.all_events() if event.event_type == "TOOL_INVOKED"]
+            self.assertEqual(len(invoke_events), 1)
+            self.assertEqual(invoke_events[0].payload["result"]["data"]["exit_code"], 0)
+            self.assertIn("recovered", invoke_events[0].payload["result"]["data"]["stdout"])
+            recovered_kernel.shutdown()
+
+    def test_git_tool_executes_authorized_status_command_and_records_result(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            event_db = Path(temp_dir) / "events.db"
+            artifact_db = Path(temp_dir) / "artifacts.db"
+            kernel = RuntimeKernel(event_db, artifact_db)
+            repo_dir = Path(temp_dir) / "repo"
+            repo_dir.mkdir()
+            subprocess.run(["git", "init"], cwd=repo_dir, check=True, capture_output=True, text=True)
+            (repo_dir / "notes.txt").write_text("hello git", encoding="utf-8")
+
+            step = StepDefinition(
+                id="git-1",
+                role="developer",
+                objective={"description": "Inspect repository status"},
+                depends_on=[],
+                outputs=[],
+                constraints={"allowed_tools": ["git"]},
+            )
+            workflow_definition = WorkflowDefinition.create(
+                name="git_tool_workflow",
+                steps=[step],
+                transitions=[],
+                policy_refs=[],
+            )
+            kernel.register_workflow_definition(workflow_definition)
+            workflow_execution_id = kernel.start_workflow(workflow_definition.workflow_definition_id)
+            step_execution_id = kernel.schedule_next_step(workflow_execution_id)
+            kernel.assign_execution(
+                step_execution_id,
+                worker_assigned={"worker_type": step.role, "worker_id": "local-worker-1"},
+                model_assigned={"adapter": "local", "model_name": "stub-model"},
+            )
+            kernel.start_execution(step_execution_id)
+            tool = Tool(
+                tool_id="git",
+                name="Git Tool",
+                description="Inspect git repositories",
+                actions=["status"],
+                allowed_roles=["developer"],
+                metadata={"kind": "git", "allowed_actions": ["status"]},
+            )
+            kernel.register_tool(tool)
+
+            decision = kernel.request_tool(step_execution_id, "git", "status", {"repo_path": str(repo_dir)})
+            self.assertTrue(decision.allowed)
+            invoke_event = next(event for event in kernel.event_log.all_events() if event.event_type == "TOOL_INVOKED")
+            self.assertEqual(invoke_event.payload["result"]["status"], "ok")
+            self.assertEqual(invoke_event.payload["result"]["data"]["exit_code"], 0)
+            self.assertIn("notes.txt", invoke_event.payload["result"]["data"]["stdout"])
+            kernel.shutdown()
+
+    def test_git_tool_rejects_unauthorized_action_via_policy(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            event_db = Path(temp_dir) / "events.db"
+            artifact_db = Path(temp_dir) / "artifacts.db"
+            kernel = RuntimeKernel(event_db, artifact_db)
+
+            step = StepDefinition(
+                id="git-2",
+                role="developer",
+                objective={"description": "Inspect repository status"},
+                depends_on=[],
+                outputs=[],
+                constraints={"allowed_tools": ["git"]},
+            )
+            workflow_definition = WorkflowDefinition.create(
+                name="git_policy_workflow",
+                steps=[step],
+                transitions=[],
+                policy_refs=[],
+            )
+            kernel.register_workflow_definition(workflow_definition)
+            workflow_execution_id = kernel.start_workflow(workflow_definition.workflow_definition_id)
+            step_execution_id = kernel.schedule_next_step(workflow_execution_id)
+            kernel.assign_execution(
+                step_execution_id,
+                worker_assigned={"worker_type": step.role, "worker_id": "local-worker-1"},
+                model_assigned={"adapter": "local", "model_name": "stub-model"},
+            )
+            kernel.start_execution(step_execution_id)
+            tool = Tool(
+                tool_id="git",
+                name="Git Tool",
+                description="Inspect git repositories",
+                actions=["status"],
+                allowed_roles=["developer"],
+                metadata={"kind": "git", "allowed_actions": ["status"]},
+            )
+            kernel.register_tool(tool)
+
+            decision = kernel.request_tool(step_execution_id, "git", "diff", {"repo_path": str(temp_dir)})
+            self.assertFalse(decision.allowed)
+            self.assertEqual(decision.reason, "tool_constraints.action_not_allowed")
+            self.assertTrue(any(event.event_type == "STEP_EXECUTION_POLICY_DENIED" for event in kernel.event_log.all_events()))
+            kernel.shutdown()
+
+    def test_capability_resolution_assigns_worker_and_model_from_step_capability(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            event_db = Path(temp_dir) / "events.db"
+            artifact_db = Path(temp_dir) / "artifacts.db"
+            kernel = RuntimeKernel(event_db, artifact_db)
+
+            step = StepDefinition(
+                id="capability-1",
+                role="developer",
+                objective={"description": "Implement feature", "required_capabilities": ["code", "reasoning"]},
+                depends_on=[],
+                outputs=[],
+                constraints={"allowed_tools": ["filesystem"]},
+            )
+            workflow_definition = WorkflowDefinition.create(
+                name="capability_resolution_workflow",
+                steps=[step],
+                transitions=[],
+                policy_refs=[],
+            )
+            kernel.register_workflow_definition(workflow_definition)
+            workflow_execution_id = kernel.start_workflow(workflow_definition.workflow_definition_id)
+            step_execution_id = kernel.schedule_next_step(workflow_execution_id)
+
+            decision = kernel.assign_execution(step_execution_id, model_adapter=StubModelAdapter())
+
+            self.assertTrue(decision.allowed)
+            assigned_event = next(event for event in kernel.event_log.all_events() if event.event_type == "STEP_EXECUTION_ASSIGNED")
+            self.assertEqual(assigned_event.payload["worker_assigned"]["worker_type"], "developer")
+            self.assertEqual(assigned_event.payload["model_assigned"]["capability"], "developer")
+            self.assertTrue(assigned_event.payload["model_assigned"]["compatible"])
+            self.assertEqual(assigned_event.payload["model_assigned"]["model_name"], "stub-model")
             kernel.shutdown()
 
     def test_require_approval_transition_moves_workflow_to_waiting_approval(self):

@@ -11,13 +11,13 @@ from .models import (
 )
 from .runtime import RuntimeKernel
 from workers.local_worker import LocalWorker
-from workers.model_adapter import StubModelAdapter
+from workers.model_adapter import ModelAdapterConfig, ModelAdapterFactory
 
 
 class RuntimeRunner:
-    def __init__(self, event_db_path: Path, artifact_db_path: Path) -> None:
+    def __init__(self, event_db_path: Path, artifact_db_path: Path, model_config: Optional[ModelAdapterConfig] = None) -> None:
         self.kernel = RuntimeKernel(event_db_path, artifact_db_path)
-        self.model_adapter = StubModelAdapter()
+        self.model_adapter = ModelAdapterFactory.create(model_config)
 
     def run_workflow(self, workflow_definition: WorkflowDefinition) -> str:
         self.kernel.register_workflow_definition(workflow_definition)
@@ -37,11 +37,9 @@ class RuntimeRunner:
             )
             assign_decision = self.kernel.assign_execution(
                 step_execution_id,
-                worker_assigned={"worker_type": step_execution.capability_required, "worker_id": "local-worker-1"},
-                model_assigned={
-                    "adapter": self.model_adapter.capabilities()["provider"],
-                    "model_name": self.model_adapter.capabilities()["name"],
-                },
+                model_adapter=self.model_adapter,
+                capability=step_execution.capability_required,
+                objective=step_definition.objective,
             )
             if not assign_decision.allowed:
                 raise RuntimeError(f"Policy denied assignment: {assign_decision.reason}")

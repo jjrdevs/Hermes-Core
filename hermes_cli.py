@@ -10,7 +10,7 @@ from typing import Any, Dict, List, Optional
 from engine.models import StepDefinition, Tool, WorkflowDefinition, WorkerRequest
 from engine.runtime import RuntimeKernel
 from workers.local_worker import LocalWorker
-from workers.model_adapter import StubModelAdapter
+from workers.model_adapter import ModelAdapterConfig, ModelAdapterFactory
 
 DEFAULT_DATA_DIR = Path.cwd() / ".hermes_data"
 ALLOWED_EVENT_NAMES = {"STEP_COMPLETED", "STEP_EXECUTION_COMPLETED", "ARTIFACT_CREATED"}
@@ -327,15 +327,27 @@ def print_artifacts(kernel: RuntimeKernel, workflow_execution_id: str) -> None:
         print(f"  title: {artifact.title}")
 
 
-def execute_step(kernel: RuntimeKernel, step_execution_id: str) -> None:
+def _build_model_config(args: Optional[argparse.Namespace] = None) -> ModelAdapterConfig:
+    provider = "stub"
+    model_name = None
+    endpoint = None
+    if args is not None:
+        provider = args.provider or provider
+        model_name = args.model_name or None
+        endpoint = args.endpoint or None
+    return ModelAdapterConfig(provider=provider, model_name=model_name, endpoint=endpoint)
+
+
+def execute_step(kernel: RuntimeKernel, step_execution_id: str, model_adapter: Optional[Any] = None) -> None:
     execution = kernel.step_executions[step_execution_id]
     step_definition = get_step_definition(kernel, step_execution_id)
-    model_adapter = StubModelAdapter()
+    model_adapter = model_adapter or ModelAdapterFactory.create(_build_model_config())
     capabilities = model_adapter.capabilities()
     decision = kernel.assign_execution(
         step_execution_id,
-        worker_assigned={"worker_type": step_definition.role, "worker_id": "local-worker-1"},
-        model_assigned={"adapter": capabilities["provider"], "model_name": capabilities["name"]},
+        model_adapter=model_adapter,
+        capability=step_definition.role,
+        objective=step_definition.objective,
     )
     if not decision.allowed:
         raise RuntimeError(f"Assignment denied: {decision.reason}")
@@ -361,7 +373,7 @@ def execute_step(kernel: RuntimeKernel, step_execution_id: str) -> None:
     kernel.complete_execution(step_execution_id, response.artifacts_created)
 
 
-def execute_workflow(kernel: RuntimeKernel, workflow_execution_id: str) -> None:
+def execute_workflow(kernel: RuntimeKernel, workflow_execution_id: str, model_adapter: Optional[Any] = None) -> None:
     while not kernel.workflow_complete(workflow_execution_id):
         step_execution_id = kernel.schedule_next_step(workflow_execution_id)
 
@@ -374,7 +386,7 @@ def execute_workflow(kernel: RuntimeKernel, workflow_execution_id: str) -> None:
 
             raise RuntimeError("Workflow is not complete and no ready steps remain")
 
-        execute_step(kernel, step_execution_id)
+        execute_step(kernel, step_execution_id, model_adapter=model_adapter)
 
     if kernel.workflow_complete(workflow_execution_id):
         kernel.complete_workflow(workflow_execution_id)
@@ -400,8 +412,9 @@ def command_run(args: argparse.Namespace) -> int:
         kernel.register_tool(tool)
     kernel.register_workflow_definition(workflow_definition)
     workflow_execution_id = kernel.start_workflow(workflow_definition.workflow_definition_id)
+    model_adapter = ModelAdapterFactory.create(_build_model_config(args))
     try:
-        execute_workflow(kernel, workflow_execution_id)
+        execute_workflow(kernel, workflow_execution_id, model_adapter=model_adapter)
     except Exception as exc:
         print(f"Execution failed: {exc}")
         kernel.shutdown()
@@ -419,8 +432,9 @@ def command_resume(args: argparse.Namespace) -> int:
         print(f"Workflow execution '{execution_id}' not found.")
         kernel.shutdown()
         return 1
+    model_adapter = ModelAdapterFactory.create(_build_model_config(args))
     try:
-        execute_workflow(kernel, execution_id)
+        execute_workflow(kernel, execution_id, model_adapter=model_adapter)
     except Exception as exc:
         print(f"Resume failed: {exc}")
         kernel.shutdown()
@@ -540,9 +554,15 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     run_parser = subparsers.add_parser("run", parents=[parent_parser], help="Run a workflow definition JSON file")
     run_parser.add_argument("workflow_json", help="Path to workflow JSON")
+    run_parser.add_argument("--provider", help="Model adapter provider (stub or ollama)", default="stub")
+    run_parser.add_argument("--model-name", help="Model name to use for the adapter", default=None)
+    run_parser.add_argument("--endpoint", help="Remote endpoint for adapter providers", default=None)
 
     resume_parser = subparsers.add_parser("resume", parents=[parent_parser], help="Resume a persisted workflow execution")
     resume_parser.add_argument("workflow_execution_id", help="Workflow execution id")
+    resume_parser.add_argument("--provider", help="Model adapter provider (stub or ollama)", default="stub")
+    resume_parser.add_argument("--model-name", help="Model name to use for the adapter", default=None)
+    resume_parser.add_argument("--endpoint", help="Remote endpoint for adapter providers", default=None)
 
     approve_parser = subparsers.add_parser("approve", parents=[parent_parser], help="Approve a waiting workflow execution")
     approve_parser.add_argument("workflow_execution_id", help="Workflow execution id")
