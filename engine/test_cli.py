@@ -1,10 +1,13 @@
 import json
+import os
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 
 from engine.models import WorkflowDefinition
+from hermes_cli import resolve_data_paths, resolve_input_path
 
 CLI = Path(__file__).resolve().parent.parent / "hermes_cli.py"
 
@@ -22,6 +25,57 @@ def run_cli(args, cwd=None, env=None):
 
 
 class TestHermesCLI(unittest.TestCase):
+    def test_resolve_data_paths_uses_home_directory_when_not_overridden(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            original_cwd = Path.cwd()
+            os.chdir(temp_dir)
+            try:
+                paths = resolve_data_paths(None)
+            finally:
+                os.chdir(original_cwd)
+
+            expected_root = Path.home() / ".hermes" / "data"
+            self.assertEqual(paths["event_db"], expected_root / "events.db")
+            self.assertEqual(paths["artifact_db"], expected_root / "artifacts.db")
+            self.assertEqual(paths["workflow_definition_db"], expected_root / "workflow_definitions.db")
+
+    def test_resolve_input_path_finds_repo_workflow_when_cwd_changes(self):
+        expected = Path(__file__).resolve().parent.parent / "examples" / "hello_world.json"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            original_cwd = Path.cwd()
+            os.chdir(temp_dir)
+            try:
+                resolved = resolve_input_path("examples/hello_world.json")
+            finally:
+                os.chdir(original_cwd)
+
+            self.assertEqual(resolved, expected)
+
+    def test_resolve_input_path_finds_bundled_workflow_when_meipass_present(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            bundled_root = Path(temp_dir)
+            bundled_examples = bundled_root / "examples"
+            bundled_examples.mkdir(parents=True, exist_ok=True)
+            expected = bundled_examples / "hello_world.json"
+            expected.write_text('{"name": "bundled"}', encoding="utf-8")
+
+            previous_meipass = getattr(sys, "_MEIPASS", None)
+            sys._MEIPASS = str(bundled_root)
+            try:
+                resolved = resolve_input_path("examples/hello_world.json")
+            finally:
+                if previous_meipass is None:
+                    del sys._MEIPASS
+                else:
+                    sys._MEIPASS = previous_meipass
+
+            self.assertEqual(resolved, expected)
+
+    def test_missing_workflow_path_raises_helpful_error(self):
+        with self.assertRaises(FileNotFoundError) as context:
+            resolve_input_path("does_not_exist.json")
+        self.assertIn("Workflow file not found", str(context.exception))
+
     def test_validate_command_accepts_valid_workflow(self):
         path = Path(__file__).resolve().parent.parent / "examples" / "hello_world.json"
         code, stdout, stderr = run_cli(["validate", str(path)])

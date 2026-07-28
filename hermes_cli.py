@@ -3,22 +3,21 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+VERSION = "0.1.0"
+
 from engine.models import StepDefinition, Tool, WorkflowDefinition, WorkerRequest
 from engine.runtime import RuntimeKernel
+from engine.workflow_loader import load_json_file, resolve_data_paths, resolve_input_path
 from workers.local_worker import LocalWorker
 from workers.model_adapter import ModelAdapterConfig, ModelAdapterFactory
 
-DEFAULT_DATA_DIR = Path.cwd() / ".hermes_data"
+DEFAULT_DATA_DIR = Path.home() / ".hermes" / "data"
 ALLOWED_EVENT_NAMES = {"STEP_COMPLETED", "STEP_EXECUTION_COMPLETED", "ARTIFACT_CREATED"}
-
-
-def load_json_file(path: Path) -> Any:
-    with path.open("r", encoding="utf-8") as handle:
-        return json.load(handle)
 
 
 def validate_workflow_schema(data: Any) -> None:
@@ -226,7 +225,11 @@ def build_tool_definitions(data: Dict[str, Any]) -> List[Tool]:
 
 
 def resolve_data_paths(data_dir: Optional[str]) -> Dict[str, Path]:
-    root = Path(data_dir).resolve() if data_dir else DEFAULT_DATA_DIR
+    if data_dir is not None:
+        root = Path(data_dir).expanduser()
+    else:
+        root = Path(os.environ.get("HERMES_DATA_DIR", str(DEFAULT_DATA_DIR))).expanduser()
+    root = root.resolve()
     root.mkdir(parents=True, exist_ok=True)
     return {
         "event_db": root / "events.db",
@@ -394,7 +397,11 @@ def execute_workflow(kernel: RuntimeKernel, workflow_execution_id: str, model_ad
 
 
 def command_validate(args: argparse.Namespace) -> int:
-    path = Path(args.workflow_json).resolve()
+    try:
+        path = resolve_input_path(args.workflow_json)
+    except FileNotFoundError as exc:
+        print(str(exc))
+        return 1
     data = load_json_file(path)
     validate_workflow_schema(data)
     print(f"Workflow definition '{data.get('name')}' is valid.")
@@ -402,7 +409,11 @@ def command_validate(args: argparse.Namespace) -> int:
 
 
 def command_run(args: argparse.Namespace) -> int:
-    path = Path(args.workflow_json).resolve()
+    try:
+        path = resolve_input_path(args.workflow_json)
+    except FileNotFoundError as exc:
+        print(str(exc))
+        return 1
     data = load_json_file(path)
     validate_workflow_schema(data)
     workflow_definition = build_workflow_definition(data)
@@ -548,7 +559,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     parent_parser.add_argument("--data-dir", help="Directory for Hermes runtime persistence", default=None)
 
     parser = argparse.ArgumentParser(description="Hermes workflow runtime CLI", parents=[parent_parser])
-    subparsers = parser.add_subparsers(dest="command", required=True)
+    parser.add_argument("--version", action="store_true", help="Print Hermes Core version and exit")
+    subparsers = parser.add_subparsers(dest="command")
 
     validate_parser = subparsers.add_parser("validate", parents=[parent_parser], help="Validate a workflow definition JSON file")
     validate_parser.add_argument("workflow_json", help="Path to workflow JSON")
@@ -584,6 +596,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     list_subparsers.add_parser("tools", parents=[parent_parser], help="List persisted tools")
 
     args = parser.parse_args(argv)
+    if args.version:
+        print(f"Hermes Core {VERSION}")
+        return 0
+    if args.command is None:
+        parser.print_help()
+        return 1
     try:
         if args.command == "validate":
             return command_validate(args)

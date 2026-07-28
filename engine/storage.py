@@ -11,7 +11,7 @@ from .models import Artifact, Event, Tool, WorkflowDefinition
 class SQLiteEventLog:
     def __init__(self, path: Path) -> None:
         self.path = path
-        self.connection = sqlite3.connect(str(path))
+        self.connection = sqlite3.connect(str(path), check_same_thread=False)
         self.connection.row_factory = sqlite3.Row
         self._initialize()
 
@@ -73,7 +73,7 @@ class SQLiteEventLog:
 class SQLiteWorkflowDefinitionStore:
     def __init__(self, path: Path) -> None:
         self.path = path
-        self.connection = sqlite3.connect(str(path))
+        self.connection = sqlite3.connect(str(path), check_same_thread=False)
         self.connection.row_factory = sqlite3.Row
         self._initialize()
 
@@ -127,7 +127,7 @@ class SQLiteWorkflowDefinitionStore:
 class SQLiteToolStore:
     def __init__(self, path: Path) -> None:
         self.path = path
-        self.connection = sqlite3.connect(str(path))
+        self.connection = sqlite3.connect(str(path), check_same_thread=False)
         self.connection.row_factory = sqlite3.Row
         self._initialize()
 
@@ -180,10 +180,57 @@ class SQLiteToolStore:
         self.connection.close()
 
 
+class SQLiteRunStore:
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.connection = sqlite3.connect(str(path), check_same_thread=False)
+        self.connection.row_factory = sqlite3.Row
+        self._initialize()
+
+    def _initialize(self) -> None:
+        self.connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS runs (
+                run_id TEXT PRIMARY KEY,
+                payload TEXT NOT NULL
+            )
+            """
+        )
+        self.connection.commit()
+
+    def create(self, run_id: str, payload: Dict[str, Any]) -> None:
+        self.connection.execute(
+            "INSERT INTO runs (run_id, payload) VALUES (?, ?)",
+            (run_id, json.dumps(payload, sort_keys=True)),
+        )
+        self.connection.commit()
+
+    def get(self, run_id: str) -> Optional[Dict[str, Any]]:
+        cursor = self.connection.execute("SELECT payload FROM runs WHERE run_id = ?", (run_id,))
+        row = cursor.fetchone()
+        if row is None:
+            return None
+        return json.loads(row["payload"])
+
+    def list(self) -> List[Dict[str, Any]]:
+        cursor = self.connection.execute("SELECT payload FROM runs ORDER BY run_id ASC")
+        return [json.loads(row["payload"]) for row in cursor]
+
+    def update(self, run_id: str, payload: Dict[str, Any]) -> None:
+        self.connection.execute(
+            "UPDATE runs SET payload = ? WHERE run_id = ?",
+            (json.dumps(payload, sort_keys=True), run_id),
+        )
+        self.connection.commit()
+
+    def close(self) -> None:
+        self.connection.close()
+
+
 class SQLiteArtifactStore:
     def __init__(self, path: Path) -> None:
         self.path = path
-        self.connection = sqlite3.connect(str(path))
+        self.connection = sqlite3.connect(str(path), check_same_thread=False)
         self.connection.row_factory = sqlite3.Row
         self._initialize()
 

@@ -1,0 +1,25 @@
+{
+  "name": "tool_example",
+  "steps": [
+    {
+      "id": "create_artifact",
+      "role": "architect",
+      "objective": {"description": "Create an artifact and optionally invoke a tool."},
+      "depends_on": [],
+      "outputs": ["tool_artifact"],
+      "constraints": {}
+    }
+  ],
+  "transitions": [],
+  "tools": [
+    {
+      "tool_id": "filesystem",
+      "name": "Filesystem Tool",
+      "description": "A local filesystem read capability for architecture steps.",
+      "actions": ["read"],
+      "allowed_roles": ["architect"],
+      "metadata": {"version": "1.0"}
+    }
+  ],
+  "policy_refs": []
+}

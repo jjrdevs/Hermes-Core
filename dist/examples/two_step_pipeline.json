@@ -1,0 +1,23 @@
+{
+  "name": "two_step_pipeline",
+  "steps": [
+    {
+      "id": "design",
+      "role": "architect",
+      "objective": {"description": "Design a two-step pipeline."},
+      "depends_on": [],
+      "outputs": ["pipeline_design"],
+      "constraints": {}
+    },
+    {
+      "id": "implement",
+      "role": "developer",
+      "objective": {"description": "Implement the pipeline using the design output."},
+      "depends_on": ["design"],
+      "outputs": ["pipeline_implementation"],
+      "constraints": {}
+    }
+  ],
+  "transitions": [],
+  "policy_refs": []
+}

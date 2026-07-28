@@ -1,0 +1,34 @@
+{
+  "name": "approval_example",
+  "steps": [
+    {
+      "id": "create_artifact",
+      "role": "architect",
+      "objective": {"description": "Create an artifact that requires approval."},
+      "depends_on": [],
+      "outputs": ["approval_artifact"],
+      "constraints": {}
+    },
+    {
+      "id": "approve_artifact",
+      "role": "human_operator",
+      "objective": {"description": "Approve the artifact produced by the architect."},
+      "depends_on": ["create_artifact"],
+      "outputs": ["approval_decision"],
+      "constraints": {}
+    }
+  ],
+  "transitions": [
+    {
+      "priority": 100,
+      "condition": {
+        "event": "STEP_COMPLETED",
+        "artifact_type": "approval_artifact"
+      },
+      "action": {
+        "require_approval": {"role": "human_operator"}
+      }
+    }
+  ],
+  "policy_refs": []
+}

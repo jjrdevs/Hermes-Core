@@ -75,7 +75,23 @@ Supported commands:
 
 Global option:
 
-- `--data-dir`: Directory for Hermes runtime persistence (default is `.hermes_data`).
+- `--data-dir`: Directory for Hermes runtime persistence (default is `~/.hermes/data`, or the `HERMES_DATA_DIR` override).
+
+## Packaging and Smoke Testing
+
+Build the packaged executable with:
+
+```bash
+./build.sh
+```
+
+Run the end-to-end smoke test against the built binary:
+
+```bash
+./scripts/smoke_test.sh
+```
+
+The smoke test validates that the packaged executable can validate a sample workflow, run it, create persisted state, inspect that state, and fail clearly for an invalid workflow input.
 
 ## Recovery Model
 
