@@ -1,11 +1,20 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
+import threading
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
 from .models import Artifact, Event, Tool, WorkflowDefinition
+from .scheduler import SQLiteJobStore
+
+
+def _now_iso() -> str:
+    return datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
 
 
 class SQLiteEventLog:
@@ -13,6 +22,7 @@ class SQLiteEventLog:
         self.path = path
         self.connection = sqlite3.connect(str(path), check_same_thread=False)
         self.connection.row_factory = sqlite3.Row
+        self._lock = threading.RLock()
         self._initialize()
 
     def _initialize(self) -> None:
@@ -32,29 +42,32 @@ class SQLiteEventLog:
         self.connection.commit()
 
     def append(self, event: Event) -> None:
-        self.connection.execute(
-            "INSERT INTO events (event_id, event_type, timestamp, workflow_id, execution_id, payload) VALUES (?, ?, ?, ?, ?, ?)",
-            (event.event_id, event.event_type, event.timestamp, event.workflow_id, event.execution_id, json.dumps(event.payload, sort_keys=True)),
-        )
-        self.connection.commit()
+        with self._lock:
+            self.connection.execute(
+                "INSERT INTO events (event_id, event_type, timestamp, workflow_id, execution_id, payload) VALUES (?, ?, ?, ?, ?, ?)",
+                (event.event_id, event.event_type, event.timestamp, event.workflow_id, event.execution_id, json.dumps(event.payload, sort_keys=True)),
+            )
+            self.connection.commit()
 
     def all_events(self) -> List[Event]:
-        cursor = self.connection.execute("SELECT * FROM events ORDER BY sequence ASC")
-        return [
-            Event(
-                event_id=row["event_id"],
-                event_type=row["event_type"],
-                timestamp=row["timestamp"],
-                workflow_id=row["workflow_id"],
-                execution_id=row["execution_id"],
-                payload=json.loads(row["payload"]),
-            )
-            for row in cursor
-        ]
+        with self._lock:
+            cursor = self.connection.execute("SELECT * FROM events ORDER BY sequence ASC")
+            return [
+                Event(
+                    event_id=row["event_id"],
+                    event_type=row["event_type"],
+                    timestamp=row["timestamp"],
+                    workflow_id=row["workflow_id"],
+                    execution_id=row["execution_id"],
+                    payload=json.loads(row["payload"]),
+                )
+                for row in cursor
+            ]
 
     def get(self, event_id: str) -> Optional[Event]:
-        cursor = self.connection.execute("SELECT * FROM events WHERE event_id = ?", (event_id,))
-        row = cursor.fetchone()
+        with self._lock:
+            cursor = self.connection.execute("SELECT * FROM events WHERE event_id = ?", (event_id,))
+            row = cursor.fetchone()
         if row is None:
             return None
         return Event(
@@ -185,6 +198,7 @@ class SQLiteRunStore:
         self.path = path
         self.connection = sqlite3.connect(str(path), check_same_thread=False)
         self.connection.row_factory = sqlite3.Row
+        self._lock = threading.RLock()
         self._initialize()
 
     def _initialize(self) -> None:
@@ -199,29 +213,224 @@ class SQLiteRunStore:
         self.connection.commit()
 
     def create(self, run_id: str, payload: Dict[str, Any]) -> None:
-        self.connection.execute(
-            "INSERT INTO runs (run_id, payload) VALUES (?, ?)",
-            (run_id, json.dumps(payload, sort_keys=True)),
-        )
-        self.connection.commit()
+        with self._lock:
+            self.connection.execute(
+                "INSERT INTO runs (run_id, payload) VALUES (?, ?)",
+                (run_id, json.dumps(payload, sort_keys=True)),
+            )
+            self.connection.commit()
 
     def get(self, run_id: str) -> Optional[Dict[str, Any]]:
-        cursor = self.connection.execute("SELECT payload FROM runs WHERE run_id = ?", (run_id,))
-        row = cursor.fetchone()
-        if row is None:
-            return None
-        return json.loads(row["payload"])
+        with self._lock:
+            cursor = self.connection.execute("SELECT payload FROM runs WHERE run_id = ?", (run_id,))
+            row = cursor.fetchone()
+            if row is None:
+                return None
+            return json.loads(row["payload"])
 
     def list(self) -> List[Dict[str, Any]]:
-        cursor = self.connection.execute("SELECT payload FROM runs ORDER BY run_id ASC")
-        return [json.loads(row["payload"]) for row in cursor]
+        with self._lock:
+            cursor = self.connection.execute("SELECT payload FROM runs ORDER BY run_id ASC")
+            return [json.loads(row["payload"]) for row in cursor]
 
     def update(self, run_id: str, payload: Dict[str, Any]) -> None:
+        with self._lock:
+            self.connection.execute(
+                "UPDATE runs SET payload = ? WHERE run_id = ?",
+                (json.dumps(payload, sort_keys=True), run_id),
+            )
+            self.connection.commit()
+
+    def close(self) -> None:
+        with self._lock:
+            self.connection.close()
+
+
+class SQLiteMemoryStore:
+    def __init__(self, path: Path, max_entries: Optional[int] = None) -> None:
+        self.path = path
+        self.connection = sqlite3.connect(str(path), check_same_thread=False)
+        self.connection.row_factory = sqlite3.Row
+        self.max_entries = max_entries or 100
+        self._initialize()
+
+    def _initialize(self) -> None:
         self.connection.execute(
-            "UPDATE runs SET payload = ? WHERE run_id = ?",
-            (json.dumps(payload, sort_keys=True), run_id),
+            """
+            CREATE TABLE IF NOT EXISTS memories (
+                memory_id TEXT PRIMARY KEY,
+                entry_type TEXT NOT NULL,
+                content TEXT NOT NULL,
+                topic TEXT NOT NULL,
+                source TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                metadata TEXT NOT NULL
+            )
+            """
         )
         self.connection.commit()
+
+    @staticmethod
+    def _sanitize_content(content: str) -> str:
+        sanitized = content
+        for pattern in [r"sk-[A-Za-z0-9_-]+", r"api[_-]?key[=:][A-Za-z0-9._-]+", r"token[=:][A-Za-z0-9._-]+", r"secret[=:][A-Za-z0-9._-]+"]:
+            sanitized = re.sub(pattern, "[REDACTED]", sanitized, flags=re.IGNORECASE)
+        return sanitized
+
+    @staticmethod
+    def _normalise_metadata(metadata: Optional[Dict[str, Any]], source: str) -> Dict[str, Any]:
+        normalised = dict(metadata or {})
+        if not isinstance(normalised, dict):
+            normalised = {}
+        if "provenance" not in normalised:
+            normalised["provenance"] = source
+        if "confidence" in normalised and normalised["confidence"] is not None:
+            try:
+                normalised["confidence"] = float(normalised["confidence"])
+            except (TypeError, ValueError):
+                normalised.pop("confidence", None)
+        return normalised
+
+    @staticmethod
+    def _parse_expiry(value: Any) -> Optional[datetime]:
+        if value is None or value == "":
+            return None
+        if isinstance(value, (int, float)):
+            return datetime.fromtimestamp(float(value), tz=timezone.utc)
+        if isinstance(value, str):
+            candidate = value.strip()
+            if not candidate:
+                return None
+            if candidate.endswith("Z"):
+                candidate = candidate[:-1] + "+00:00"
+            try:
+                return datetime.fromisoformat(candidate)
+            except ValueError:
+                try:
+                    return datetime.fromtimestamp(float(candidate), tz=timezone.utc)
+                except ValueError:
+                    return None
+        return None
+
+    @classmethod
+    def _is_expired(cls, metadata: Optional[Dict[str, Any]]) -> bool:
+        if not isinstance(metadata, dict):
+            return False
+        expires_at = metadata.get("expires_at")
+        parsed = cls._parse_expiry(expires_at)
+        if parsed is None:
+            return False
+        return parsed.astimezone(timezone.utc) <= datetime.now(timezone.utc)
+
+    def _prune_if_needed(self) -> None:
+        count = self.connection.execute("SELECT COUNT(*) AS count FROM memories").fetchone()["count"]
+        if count <= self.max_entries:
+            return
+        rows = self.connection.execute(
+            "SELECT memory_id FROM memories ORDER BY created_at ASC LIMIT ?",
+            (count - self.max_entries,),
+        ).fetchall()
+        if not rows:
+            return
+        self.connection.executemany("DELETE FROM memories WHERE memory_id = ?", [(row["memory_id"],) for row in rows])
+        self.connection.commit()
+
+    def add(self, entry_type: str, content: str, topic: str, source: str, metadata: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        sanitized_content = self._sanitize_content(content)
+        metadata_payload = self._normalise_metadata(metadata, source)
+        payload = {
+            "memory_id": str(uuid.uuid4()),
+            "entry_type": entry_type,
+            "content": sanitized_content,
+            "topic": topic,
+            "source": source,
+            "created_at": _now_iso(),
+            "metadata": metadata_payload,
+        }
+        self.connection.execute(
+            "INSERT INTO memories (memory_id, entry_type, content, topic, source, created_at, metadata) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                payload["memory_id"],
+                payload["entry_type"],
+                payload["content"],
+                payload["topic"],
+                payload["source"],
+                payload["created_at"],
+                json.dumps(payload["metadata"], sort_keys=True),
+            ),
+        )
+        self.connection.commit()
+        self._prune_if_needed()
+        return payload
+
+    def list(self, topic: Optional[str] = None, limit: int = 10) -> List[Dict[str, Any]]:
+        query = "SELECT * FROM memories"
+        params: List[Any] = []
+        if topic:
+            query += " WHERE topic = ?"
+            params.append(topic)
+        query += " ORDER BY created_at DESC LIMIT ?"
+        params.append(limit)
+        rows = self.connection.execute(query, params).fetchall()
+        valid: List[Dict[str, Any]] = []
+        for row in rows:
+            metadata = json.loads(row["metadata"])
+            if self._is_expired(metadata):
+                continue
+            valid.append(
+                {
+                    "memory_id": row["memory_id"],
+                    "entry_type": row["entry_type"],
+                    "content": row["content"],
+                    "topic": row["topic"],
+                    "source": row["source"],
+                    "created_at": row["created_at"],
+                    "metadata": metadata,
+                }
+            )
+        return valid
+
+    def record_usage(self, memory_id: str, outcome: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        row = self.connection.execute(
+            "SELECT memory_id, entry_type, content, topic, source, created_at, metadata FROM memories WHERE memory_id = ?",
+            (memory_id,),
+        ).fetchone()
+        if row is None:
+            return None
+
+        metadata = json.loads(row["metadata"]) if row["metadata"] else {}
+        if not isinstance(metadata, dict):
+            metadata = {}
+
+        usage_count = int(metadata.get("usage_count", 0) or 0) + 1
+        metadata["usage_count"] = usage_count
+        metadata["last_used_at"] = _now_iso()
+        if outcome in {"helpful", "neutral", "harmful"}:
+            existing_outcome = str(metadata.get("outcome") or "").lower()
+            if existing_outcome not in {"helpful", "neutral", "harmful"}:
+                metadata["outcome"] = outcome
+            elif outcome == "helpful" and existing_outcome != "helpful":
+                metadata["outcome"] = "helpful"
+            elif outcome == "harmful" and existing_outcome == "helpful":
+                metadata["outcome"] = "helpful"
+            elif outcome == "neutral" and existing_outcome == "harmful":
+                metadata["outcome"] = "neutral"
+
+        self.connection.execute(
+            "UPDATE memories SET metadata = ? WHERE memory_id = ?",
+            (json.dumps(metadata, sort_keys=True), memory_id),
+        )
+        self.connection.commit()
+
+        return {
+            "memory_id": row["memory_id"],
+            "entry_type": row["entry_type"],
+            "content": row["content"],
+            "topic": row["topic"],
+            "source": row["source"],
+            "created_at": row["created_at"],
+            "metadata": metadata,
+        }
 
     def close(self) -> None:
         self.connection.close()

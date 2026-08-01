@@ -24,6 +24,46 @@ from workers.model_adapter import StubModelAdapter
 
 
 class TestRuntimeRunner(unittest.TestCase):
+    def test_tool_risk_level_is_persisted_and_emitted_with_invocation(self):
+        tool = Tool(
+            tool_id="filesystem",
+            name="Filesystem Tool",
+            description="Read workspace files",
+            actions=["read"],
+            allowed_roles=["developer"],
+            metadata={},
+        )
+        self.assertEqual(tool.resolved_risk_level(), "read_only")
+        self.assertEqual(tool.to_dict()["risk_level"], "read_only")
+
+    def test_tool_risk_level_rejects_unknown_explicit_values(self):
+        tool = Tool(
+            tool_id="filesystem",
+            name="Filesystem Tool",
+            description="Access files",
+            actions=["read"],
+            allowed_roles=["developer"],
+            metadata={},
+            risk_level="unsafe",
+        )
+        with self.assertRaises(ValueError):
+            tool.to_dict()
+
+    def test_runtime_loads_web_capability_packages(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            event_db = Path(temp_dir) / "events.db"
+            artifact_db = Path(temp_dir) / "artifacts.db"
+            kernel = RuntimeKernel(event_db, artifact_db)
+
+            web_search = kernel.capability_registry.get("web_search")
+            web_extract = kernel.capability_registry.get("web_extract")
+
+            self.assertEqual(web_search.get("capability"), "web_search")
+            self.assertEqual(web_extract.get("capability"), "web_extract")
+            self.assertEqual(web_search.get("tool_ids"), ["web_search"])
+            self.assertEqual(web_extract.get("tool_ids"), ["web_extract"])
+            kernel.shutdown()
+
     def test_runtime_runner_executes_first_step_and_stores_artifact(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             event_db = Path(temp_dir) / "events.db"
@@ -146,6 +186,22 @@ class TestRuntimeRunner(unittest.TestCase):
             self.assertEqual(worker_profile["execution_context"], execution_context.to_dict())
             self.assertEqual(model_profile["execution_context"], execution_context.to_dict())
             kernel.shutdown()
+
+    def test_execution_context_round_trips_capability_contract(self):
+        execution_context = ExecutionContext(
+            execution_mode="autonomous",
+            policy_profile="default",
+            sandbox_profile="strict",
+            capability_contract={"allowed_commands": ["python"], "allow_network": False},
+        )
+
+        serialized = execution_context.to_dict()
+        self.assertEqual(serialized["capability_contract"]["allowed_commands"], ["python"])
+        self.assertFalse(serialized["capability_contract"]["allow_network"])
+
+        restored = ExecutionContext.from_dict(serialized)
+        self.assertEqual(restored.capability_contract["allowed_commands"], ["python"])
+        self.assertFalse(restored.capability_contract["allow_network"])
 
     def test_runtime_kernel_recovers_definitions_and_events_on_restart(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -659,8 +715,99 @@ class TestRuntimeRunner(unittest.TestCase):
             decision = kernel.request_tool(step_execution_id, "filesystem", "read", {"path": "/tmp"})
             self.assertTrue(decision.allowed)
             events = kernel.event_log.all_events()
-            self.assertTrue(any(event.event_type == "TOOL_REQUESTED" for event in events))
+            requested_event = next(event for event in events if event.event_type == "TOOL_REQUESTED")
+            self.assertEqual(requested_event.payload["risk_level"], "read_only")
             self.assertTrue(any(event.event_type == "TOOL_INVOKED" for event in events))
+            kernel.shutdown()
+
+    def test_destructive_tool_request_requires_approval_before_side_effect(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            event_db = Path(temp_dir) / "events.db"
+            artifact_db = Path(temp_dir) / "artifacts.db"
+            workspace_dir = Path(temp_dir) / "workspace"
+            workspace_dir.mkdir()
+            target_path = workspace_dir / "remove.txt"
+            target_path.write_text("remove me", encoding="utf-8")
+            kernel = RuntimeKernel(event_db, artifact_db)
+
+            step = StepDefinition(
+                id="destructive-1",
+                role="architect",
+                objective={"description": "Remove an approved file"},
+                depends_on=[],
+                outputs=[],
+                constraints={"allowed_tools": ["filesystem"]},
+            )
+            workflow_definition = WorkflowDefinition.create(
+                name="destructive_tool_approval_workflow",
+                steps=[step],
+                transitions=[],
+                policy_refs=[],
+            )
+            kernel.register_workflow_definition(workflow_definition)
+            workflow_execution_id = kernel.start_workflow(workflow_definition.workflow_definition_id)
+            step_execution_id = kernel.schedule_next_step(workflow_execution_id)
+            kernel.assign_execution(
+                step_execution_id,
+                worker_assigned={"worker_type": step.role, "worker_id": "local-worker-1"},
+                model_assigned={"adapter": "local", "model_name": "stub-model"},
+            )
+            kernel.start_execution(step_execution_id)
+            kernel.register_tool(
+                Tool(
+                    tool_id="filesystem",
+                    name="Filesystem Tool",
+                    description="Manage workspace files",
+                    actions=["delete_file"],
+                    allowed_roles=["architect"],
+                    metadata={"allowed_roots": [str(workspace_dir)]},
+                )
+            )
+            parameters = {"path": str(target_path)}
+
+            blocked = kernel.request_tool(step_execution_id, "filesystem", "delete_file", parameters)
+
+            self.assertFalse(blocked.allowed)
+            self.assertEqual(blocked.reason, "tool_approval_required")
+            self.assertEqual(kernel.get_workflow_status(workflow_execution_id), "WAITING_APPROVAL")
+            self.assertTrue(target_path.exists())
+            approval_id = f"tool-approval-{kernel._tool_request_fingerprint('filesystem', 'delete_file', parameters)[:16]}"
+
+            approved = kernel.approve_tool_request(
+                step_execution_id,
+                approval_id,
+                approved_by="test-user",
+                reason="approved for cleanup",
+            )
+            self.assertTrue(approved.allowed)
+            kernel.shutdown()
+            kernel = RuntimeKernel(event_db, artifact_db)
+            self.assertEqual(kernel.get_workflow_status(workflow_execution_id), "EXECUTING")
+            executed = kernel.request_tool(step_execution_id, "filesystem", "delete_file", parameters)
+
+            self.assertTrue(executed.allowed)
+            self.assertFalse(target_path.exists())
+            self.assertTrue(any(event.event_type == "TOOL_APPROVAL_REQUIRED" for event in kernel.event_log.all_events()))
+            self.assertTrue(any(event.event_type == "TOOL_APPROVAL_GRANTED" for event in kernel.event_log.all_events()))
+
+            denied_path = workspace_dir / "keep.txt"
+            denied_path.write_text("keep me", encoding="utf-8")
+            denied_parameters = {"path": str(denied_path)}
+            blocked_again = kernel.request_tool(step_execution_id, "filesystem", "delete_file", denied_parameters)
+            denied_approval_id = f"tool-approval-{kernel._tool_request_fingerprint('filesystem', 'delete_file', denied_parameters)[:16]}"
+            denied = kernel.deny_tool_request(
+                step_execution_id,
+                denied_approval_id,
+                denied_by="test-user",
+                reason="retain file",
+            )
+
+            self.assertFalse(blocked_again.allowed)
+            self.assertFalse(denied.allowed)
+            self.assertEqual(denied.reason, "tool_approval_denied")
+            self.assertEqual(kernel.get_workflow_status(workflow_execution_id), "FAILED")
+            self.assertTrue(denied_path.exists())
+            self.assertTrue(any(event.event_type == "TOOL_APPROVAL_DENIED" for event in kernel.event_log.all_events()))
             kernel.shutdown()
 
     def test_workflow_enters_executing_after_step_start(self):
@@ -799,6 +946,52 @@ class TestRuntimeRunner(unittest.TestCase):
             self.assertEqual(invoke_event.payload["result"]["data"]["metadata"]["command"], ["python", "-c", "print('hello-shell')"])
             kernel.shutdown()
 
+    def test_tool_invocation_fails_closed_when_policy_context_is_missing(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            event_db = Path(temp_dir) / "events.db"
+            artifact_db = Path(temp_dir) / "artifacts.db"
+            kernel = RuntimeKernel(event_db, artifact_db)
+
+            step = StepDefinition(
+                id="shell-2a",
+                role="architect",
+                objective={"description": "Run a command without explicit policy context"},
+                depends_on=[],
+                outputs=[],
+                constraints={"allowed_tools": ["shell"]},
+            )
+            workflow_definition = WorkflowDefinition.create(
+                name="missing_policy_context_workflow",
+                steps=[step],
+                transitions=[],
+                policy_refs=[],
+            )
+            kernel.register_workflow_definition(workflow_definition)
+            workflow_execution_id = kernel.start_workflow(workflow_definition.workflow_definition_id)
+            step_execution_id = kernel.schedule_next_step(workflow_execution_id)
+            kernel.assign_execution(
+                step_execution_id,
+                worker_assigned={"worker_type": step.role, "worker_id": "local-worker-1"},
+                model_assigned={"adapter": "local", "model_name": "stub-model"},
+            )
+            kernel.start_execution(step_execution_id)
+            kernel.step_executions[step_execution_id].policy_context = {}
+            tool = Tool(
+                tool_id="shell",
+                name="Shell Tool",
+                description="Run shell commands",
+                actions=["exec"],
+                allowed_roles=["architect"],
+                metadata={"kind": "shell", "allowed_commands": ["python"]},
+            )
+            kernel.register_tool(tool)
+
+            decision = kernel.request_tool(step_execution_id, "shell", "exec", {"command": ["python", "-c", "print('hello-shell')"]})
+            self.assertFalse(decision.allowed)
+            self.assertEqual(decision.reason, "policy_context.missing")
+            self.assertTrue(any(event.event_type == "STEP_EXECUTION_POLICY_DENIED" for event in kernel.event_log.all_events()))
+            kernel.shutdown()
+
     def test_shell_tool_rejects_unauthorized_command_via_policy(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             event_db = Path(temp_dir) / "events.db"
@@ -841,6 +1034,114 @@ class TestRuntimeRunner(unittest.TestCase):
             decision = kernel.request_tool(step_execution_id, "shell", "exec", {"command": ["pytest", "-q"]})
             self.assertFalse(decision.allowed)
             self.assertEqual(decision.reason, "tool_constraints.command_not_allowed")
+            self.assertTrue(any(event.event_type == "STEP_EXECUTION_POLICY_DENIED" for event in kernel.event_log.all_events()))
+            kernel.shutdown()
+
+    def test_kernel_tool_request_enforces_capability_contract_on_shell_commands(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            event_db = Path(temp_dir) / "events.db"
+            artifact_db = Path(temp_dir) / "artifacts.db"
+            kernel = RuntimeKernel(event_db, artifact_db)
+
+            step = StepDefinition(
+                id="shell-4",
+                role="architect",
+                objective={"description": "Run a blocked shell command"},
+                depends_on=[],
+                outputs=[],
+                constraints={"allowed_tools": ["shell"]},
+            )
+            workflow_definition = WorkflowDefinition.create(
+                name="capability_contract_shell_workflow",
+                steps=[step],
+                transitions=[],
+                policy_refs=[],
+            )
+            kernel.register_workflow_definition(workflow_definition)
+            workflow_execution_id = kernel.start_workflow(
+                workflow_definition.workflow_definition_id,
+                execution_context=ExecutionContext(
+                    execution_mode="autonomous",
+                    policy_profile="default",
+                    sandbox_profile="standard",
+                    capability_contract={"allowed_commands": ["python"], "allow_network": False},
+                ),
+            )
+            step_execution_id = kernel.schedule_next_step(workflow_execution_id)
+            kernel.assign_execution(
+                step_execution_id,
+                worker_assigned={"worker_type": step.role, "worker_id": "local-worker-1"},
+                model_assigned={"adapter": "local", "model_name": "stub-model"},
+            )
+            kernel.start_execution(step_execution_id)
+            tool = Tool(
+                tool_id="shell",
+                name="Shell Tool",
+                description="Run shell commands",
+                actions=["exec"],
+                allowed_roles=["architect"],
+                metadata={"kind": "shell", "allowed_commands": ["python", "pytest"]},
+            )
+            kernel.register_tool(tool)
+
+            decision = kernel.request_tool(step_execution_id, "shell", "exec", {"command": ["pytest", "-q"]})
+
+            self.assertFalse(decision.allowed)
+            self.assertEqual(decision.reason, "capability_contract.command_not_allowed")
+            self.assertTrue(any(event.event_type == "STEP_EXECUTION_POLICY_DENIED" for event in kernel.event_log.all_events()))
+            kernel.shutdown()
+
+    def test_kernel_filesystem_tool_request_enforces_capability_contract_allowed_roots(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            event_db = Path(temp_dir) / "events.db"
+            artifact_db = Path(temp_dir) / "artifacts.db"
+            kernel = RuntimeKernel(event_db, artifact_db)
+
+            step = StepDefinition(
+                id="fs-1",
+                role="architect",
+                objective={"description": "Read a blocked file path"},
+                depends_on=[],
+                outputs=[],
+                constraints={"allowed_tools": ["filesystem"]},
+            )
+            workflow_definition = WorkflowDefinition.create(
+                name="capability_contract_filesystem_workflow",
+                steps=[step],
+                transitions=[],
+                policy_refs=[],
+            )
+            kernel.register_workflow_definition(workflow_definition)
+            workflow_execution_id = kernel.start_workflow(
+                workflow_definition.workflow_definition_id,
+                execution_context=ExecutionContext(
+                    execution_mode="autonomous",
+                    policy_profile="default",
+                    sandbox_profile="standard",
+                    capability_contract={"allowed_roots": [str(Path(temp_dir) / "allowed")], "writable_paths": [str(Path(temp_dir) / "allowed")]},
+                ),
+            )
+            step_execution_id = kernel.schedule_next_step(workflow_execution_id)
+            kernel.assign_execution(
+                step_execution_id,
+                worker_assigned={"worker_type": step.role, "worker_id": "local-worker-1"},
+                model_assigned={"adapter": "local", "model_name": "stub-model"},
+            )
+            kernel.start_execution(step_execution_id)
+            tool = Tool(
+                tool_id="filesystem",
+                name="Filesystem Tool",
+                description="Read filesystem paths",
+                actions=["read_file"],
+                allowed_roles=["architect"],
+                metadata={"kind": "filesystem", "allowed_roots": [str(temp_dir)]},
+            )
+            kernel.register_tool(tool)
+
+            decision = kernel.request_tool(step_execution_id, "filesystem", "read_file", {"path": str(Path(temp_dir) / "blocked" / "secret.txt")})
+
+            self.assertFalse(decision.allowed)
+            self.assertEqual(decision.reason, "capability_contract.path_not_allowed")
             self.assertTrue(any(event.event_type == "STEP_EXECUTION_POLICY_DENIED" for event in kernel.event_log.all_events()))
             kernel.shutdown()
 
@@ -1100,16 +1401,27 @@ class TestRuntimeRunner(unittest.TestCase):
             self.assertEqual(diff_event.payload["result"]["status"], "ok")
             self.assertIn("hello git update", diff_event.payload["result"]["data"]["stdout"])
 
+            commit_parameters = {
+                "repo_path": str(repo_dir),
+                "message": "update notes",
+                "files": ["notes.txt"],
+            }
             commit_decision = kernel.request_tool(
                 step_execution_id,
                 "git",
                 "commit",
-                {
-                    "repo_path": str(repo_dir),
-                    "message": "update notes",
-                    "files": ["notes.txt"],
-                },
+                commit_parameters,
             )
+            self.assertFalse(commit_decision.allowed)
+            commit_approval_id = f"tool-approval-{kernel._tool_request_fingerprint('git', 'commit', commit_parameters)[:16]}"
+            self.assertTrue(
+                kernel.approve_tool_request(
+                    step_execution_id,
+                    commit_approval_id,
+                    approved_by="test-user",
+                ).allowed
+            )
+            commit_decision = kernel.request_tool(step_execution_id, "git", "commit", commit_parameters)
             self.assertTrue(commit_decision.allowed)
             commit_event = next(
                 event for event in kernel.event_log.all_events() if event.event_type == "TOOL_INVOKED" and event.payload["action"] == "commit"
@@ -1117,12 +1429,23 @@ class TestRuntimeRunner(unittest.TestCase):
             self.assertEqual(commit_event.payload["result"]["status"], "ok")
             self.assertIn("commit_hash", commit_event.payload["result"]["data"])
 
+            checkout_parameters = {"repo_path": str(repo_dir), "branch": "feature/demo"}
             checkout_decision = kernel.request_tool(
                 step_execution_id,
                 "git",
                 "checkout",
-                {"repo_path": str(repo_dir), "branch": "feature/demo"},
+                checkout_parameters,
             )
+            self.assertFalse(checkout_decision.allowed)
+            checkout_approval_id = f"tool-approval-{kernel._tool_request_fingerprint('git', 'checkout', checkout_parameters)[:16]}"
+            self.assertTrue(
+                kernel.approve_tool_request(
+                    step_execution_id,
+                    checkout_approval_id,
+                    approved_by="test-user",
+                ).allowed
+            )
+            checkout_decision = kernel.request_tool(step_execution_id, "git", "checkout", checkout_parameters)
             self.assertTrue(checkout_decision.allowed)
             checkout_event = next(
                 event for event in kernel.event_log.all_events() if event.event_type == "TOOL_INVOKED" and event.payload["action"] == "checkout"
@@ -1701,4 +2024,60 @@ class TestRuntimeRunner(unittest.TestCase):
             self.assertEqual(original_workflow_events, recovered_workflow_events)
             self.assertTrue(any(event.event_type == "TOOL_REQUESTED" for event in recovered_kernel.event_log.all_events()))
             self.assertTrue(any(event.event_type == "TOOL_INVOKED" for event in recovered_kernel.event_log.all_events()))
+            recovered_kernel.shutdown()
+
+    def test_step_policy_context_replays_with_tool_approval_state(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            event_db = Path(temp_dir) / "events.db"
+            artifact_db = Path(temp_dir) / "artifacts.db"
+            kernel = RuntimeKernel(event_db, artifact_db)
+
+            step = StepDefinition(
+                id="policy-replay",
+                role="architect",
+                objective={"description": "Delete a file with approval"},
+                depends_on=[],
+                outputs=[],
+                constraints={"allowed_tools": ["filesystem"]},
+            )
+            workflow_definition = WorkflowDefinition.create(
+                name="policy_context_replay_workflow",
+                steps=[step],
+                transitions=[],
+                policy_refs=[],
+            )
+            kernel.register_workflow_definition(workflow_definition)
+            workflow_execution_id = kernel.start_workflow(workflow_definition.workflow_definition_id)
+            kernel.workflow_executions[workflow_execution_id].policy_context = {
+                "approved": True,
+                "policy_ids": ["file-maintenance"],
+            }
+            step_execution_id = kernel.schedule_next_step(workflow_execution_id)
+            kernel.assign_execution(
+                step_execution_id,
+                worker_assigned={"worker_type": step.role, "worker_id": "local-worker-1"},
+                model_assigned={"adapter": "local", "model_name": "stub-model"},
+            )
+            kernel.start_execution(step_execution_id)
+            marker = Path(temp_dir) / "delete-me.txt"
+            marker.write_text("remove me\n", encoding="utf-8")
+            tool = Tool(
+                tool_id="filesystem",
+                name="Filesystem Tool",
+                description="Access files",
+                actions=["delete_file"],
+                allowed_roles=["architect"],
+                metadata={"allowed_roots": [temp_dir]},
+            )
+            kernel.register_tool(tool)
+
+            decision = kernel.request_tool(step_execution_id, "filesystem", "delete_file", {"path": str(marker)})
+            self.assertFalse(decision.allowed)
+            self.assertEqual(decision.reason, "tool_approval_required")
+            kernel.shutdown()
+
+            recovered_kernel = RuntimeKernel(event_db, artifact_db)
+            recovered_step = recovered_kernel.step_executions[step_execution_id]
+            self.assertEqual(recovered_step.policy_context["policy_ids"], ["file-maintenance"])
+            self.assertEqual(recovered_step.policy_context["approved"], True)
             recovered_kernel.shutdown()

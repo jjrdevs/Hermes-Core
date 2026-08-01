@@ -1,0 +1,9 @@
+{
+  "type": "object",
+  "properties": {
+    "url": {"type": "string", "format": "uri"},
+    "max_chars": {"type": "integer", "minimum": 1, "maximum": 10000}
+  },
+  "required": ["url"],
+  "additionalProperties": false
+}

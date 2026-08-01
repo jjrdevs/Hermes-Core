@@ -9,8 +9,25 @@ class HermesApi:
     def __init__(self, data_dir: Optional[str] = None) -> None:
         self.service = RuntimeService(data_dir=data_dir)
 
-    def run_workflow(self, workflow_path: str, *, provider: str = "stub", model_name: Optional[str] = None, endpoint: Optional[str] = None) -> Dict[str, Any]:
-        return self.service.run_workflow(workflow_path, provider=provider, model_name=model_name, endpoint=endpoint)
+    def run_workflow(
+        self,
+        workflow_path: str,
+        *,
+        provider: str = "stub",
+        model_name: Optional[str] = None,
+        endpoint: Optional[str] = None,
+        context: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        return self.service.run_workflow(
+            workflow_path,
+            provider=provider,
+            model_name=model_name,
+            endpoint=endpoint,
+            context=context,
+        )
+
+    def run_task(self, task: str, *, workspace_path: Optional[str] = None, context: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        return self.service.run_task(task, workspace_path=workspace_path, context=context)
 
     def start_run(
         self,
@@ -49,6 +66,15 @@ class HermesApi:
     def get_run_artifacts(self, run_id: str) -> list[Dict[str, Any]]:
         return self.service.get_run_artifacts(run_id)
 
+    def list_checkpoints(self) -> list[Dict[str, Any]]:
+        return self.service.list_checkpoints()
+
+    def get_checkpoint(self, checkpoint_id: str) -> Optional[Dict[str, Any]]:
+        return self.service.get_checkpoint(checkpoint_id)
+
+    def get_change_record(self, checkpoint_id: str) -> Optional[Dict[str, Any]]:
+        return self.service.get_change_record(checkpoint_id)
+
     def cancel_run(self, run_id: str) -> Dict[str, Any]:
         return self.service.cancel_run(run_id)
 
@@ -60,6 +86,7 @@ class HermesApi:
                 provider=payload.get("provider", "stub"),
                 model_name=payload.get("model_name"),
                 endpoint=payload.get("endpoint"),
+                context=payload.get("context"),
             )
         if action in {"start_run", "start"}:
             return self.start_run(
@@ -83,6 +110,12 @@ class HermesApi:
             return self.observe_run(payload["run_id"])
         if action in {"get_run_artifacts", "artifacts"}:
             return self.get_run_artifacts(payload["run_id"])
+        if action == "list_checkpoints":
+            return self.list_checkpoints()
+        if action == "get_checkpoint":
+            return self.get_checkpoint(payload["checkpoint_id"])
+        if action in {"get_change", "get_change_record"}:
+            return self.get_change_record(payload["checkpoint_id"])
         if action in {"cancel_run", "cancel"}:
             return self.cancel_run(payload["run_id"])
         if action in {"append_event", "append"}:
@@ -91,6 +124,26 @@ class HermesApi:
             return self.finalize_run(payload["run_id"], payload.get("status"))
         if action in {"respond_approval", "approve"}:
             return self.respond_approval(payload["run_id"], payload.get("choice", "approve"))
+        if action in {"approve_tool", "approve_tool_request"}:
+            return self.approve_tool_request(
+                payload["run_id"],
+                payload["approval_id"],
+                approved_by=payload.get("approved_by", "api-user"),
+                reason=payload.get("reason", "approved"),
+                comment=payload.get("comment"),
+            )
+        if action in {"deny_tool", "deny_tool_request"}:
+            return self.deny_tool_request(
+                payload["run_id"],
+                payload["approval_id"],
+                denied_by=payload.get("denied_by", "api-user"),
+                reason=payload.get("reason", "denied"),
+                comment=payload.get("comment"),
+            )
+        if action in {"list_tool_approvals", "pending_tool_approvals"}:
+            return self.service.list_pending_tool_approvals(payload.get("run_id"))
+        if action in {"list_policy_denials", "policy_denials"}:
+            return self.service.list_policy_denials(payload.get("run_id"))
         if action in {"control", "handle_action"}:
             return self.handle_action(
                 payload["run_id"],
@@ -113,6 +166,46 @@ class HermesApi:
 
     def respond_approval(self, run_id: str, choice: str) -> Dict[str, Any]:
         return self.service.respond_approval(run_id, choice)
+
+    def approve_tool_request(
+        self,
+        run_id: str,
+        approval_id: str,
+        *,
+        approved_by: str = "api-user",
+        reason: str = "approved",
+        comment: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        return self.service.approve_tool_request(
+            run_id,
+            approval_id,
+            approved_by=approved_by,
+            reason=reason,
+            comment=comment,
+        )
+
+    def deny_tool_request(
+        self,
+        run_id: str,
+        approval_id: str,
+        *,
+        denied_by: str = "api-user",
+        reason: str = "denied",
+        comment: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        return self.service.deny_tool_request(
+            run_id,
+            approval_id,
+            denied_by=denied_by,
+            reason=reason,
+            comment=comment,
+        )
+
+    def list_pending_tool_approvals(self, run_id: Optional[str] = None) -> list[Dict[str, Any]]:
+        return self.service.list_pending_tool_approvals(run_id)
+
+    def list_policy_denials(self, run_id: Optional[str] = None) -> list[Dict[str, Any]]:
+        return self.service.list_policy_denials(run_id)
 
     def handle_action(
         self,

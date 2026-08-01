@@ -51,7 +51,7 @@ class TestHermesCLIIntegration(unittest.TestCase):
             code, stdout, stderr = run_cli(["resume", workflow_execution_id, "--data-dir", str(data_dir)])
             self.assertEqual(code, 0, stderr)
             self.assertIn("Status: COMPLETED", stdout)
-            self.assertIn("Produced artifacts:", stdout)
+            self.assertIn("Artifacts:", stdout)
             self.assertIn("Tool activity:", stdout)
 
             code, stdout, stderr = run_cli(["list", "workflows", "--data-dir", str(data_dir)])

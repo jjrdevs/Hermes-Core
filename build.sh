@@ -33,6 +33,16 @@ mkdir -p "$OUTPUT_DIR"
   --specpath "$ROOT_DIR/build" \
   hermes_cli.py
 
+"$PYTHON_BIN" -m PyInstaller \
+  --clean \
+  --name hermes-webui-launcher \
+  --onefile \
+  --distpath "$OUTPUT_DIR" \
+  --workpath "$ROOT_DIR/build" \
+  --specpath "$ROOT_DIR/build" \
+  --add-data "${ROOT_DIR}/desktop_launcher.py:." \
+  launcher_entry.py
+
 mkdir -p "$OUTPUT_DIR/examples"
 cp -R "$ROOT_DIR/examples/." "$OUTPUT_DIR/examples/"
 
@@ -46,5 +56,6 @@ cat > "$OUTPUT_DIR/release-manifest.json" <<EOF
 EOF
 
 echo "Built executable at $OUTPUT_DIR/hermes"
+echo "Built desktop launcher at $OUTPUT_DIR/hermes-webui-launcher"
 echo "Bundled examples at $OUTPUT_DIR/examples"
 echo "Release manifest at $OUTPUT_DIR/release-manifest.json"

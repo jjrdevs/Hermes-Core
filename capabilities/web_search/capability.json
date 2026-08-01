@@ -1,0 +1,9 @@
+{
+  "capability": "web_search",
+  "description": "Search the public web for relevant content",
+  "required_features": ["web", "search", "reasoning"],
+  "preferred_context_window": 32768,
+  "requires_tool_support": true,
+  "tool_ids": ["web_search"],
+  "allowed_roles": ["researcher", "architect", "developer"]
+}

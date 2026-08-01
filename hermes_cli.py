@@ -8,10 +8,23 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from engine.runtime_service import RuntimeService
+
 VERSION = "0.1.0"
 
 from engine.models import StepDefinition, Tool, WorkflowDefinition, WorkerRequest
 from engine.runtime import RuntimeKernel
+from engine.scheduler import BackgroundScheduler, SQLiteJobStore
+from engine.storage import SQLiteMemoryStore
+
+
+def _format_job_status(row: Any) -> str:
+    payload = row["payload"] if isinstance(row, dict) else {}
+    execution_status = payload.get("execution_status") or {}
+    checkpoint_id = execution_status.get("checkpoint_id") or payload.get("checkpoint")
+    resume_hint = execution_status.get("resume_hint") or {}
+    can_resume = bool(resume_hint.get("can_resume"))
+    return f"status={row['status']} checkpoint={checkpoint_id or 'none'} resume={str(can_resume).lower()}"
 from engine.workflow_loader import load_json_file, resolve_data_paths, resolve_input_path
 from workers.local_worker import LocalWorker
 from workers.model_adapter import ModelAdapterConfig, ModelAdapterFactory
@@ -279,7 +292,7 @@ def _tool_activity(kernel: RuntimeKernel, workflow_execution) -> Dict[str, int]:
     return activity
 
 
-def print_workflow_summary(kernel: RuntimeKernel, workflow_execution_id: str) -> None:
+def print_workflow_summary(kernel: RuntimeKernel, workflow_execution_id: str, *, data_dir: Optional[str] = None) -> None:
     workflow_execution = kernel.workflow_executions[workflow_execution_id]
     current_steps = [kernel.step_executions[step_id] for step_id in workflow_execution.active_executions]
     completed_steps = [kernel.step_executions[step_id] for step_id in workflow_execution.completed_executions]
@@ -299,13 +312,41 @@ def print_workflow_summary(kernel: RuntimeKernel, workflow_execution_id: str) ->
     print(f"Pending approval: {approval_role if approval_role is not None else 'none'}")
     print(f"Completed steps: {', '.join(step.step_id for step in completed_steps) if completed_steps else 'none'}")
     print(f"Failed steps: {', '.join(step.step_id for step in failed_steps) if failed_steps else 'none'}")
-    print(f"Produced artifacts: {len(workflow_execution.produced_artifacts)}")
+    print(f"Artifacts: {len(workflow_execution.produced_artifacts)}")
     if workflow_execution.produced_artifacts:
         for artifact_id in workflow_execution.produced_artifacts:
             artifact = kernel.artifact_store.get(artifact_id)
             if artifact is None:
                 continue
             print(f"- {artifact.artifact_id}: {artifact.artifact_type} ({artifact.title})")
+
+    latest_checkpoint = None
+    try:
+        service = RuntimeService(data_dir=data_dir)
+        try:
+            checkpoints = service.list_checkpoints()
+            if checkpoints:
+                latest_checkpoint = checkpoints[0]
+        finally:
+            service.shutdown()
+    except Exception:
+        latest_checkpoint = None
+
+    if latest_checkpoint is None:
+        print("Latest checkpoint: none")
+    else:
+        print(f"Latest checkpoint: {latest_checkpoint['checkpoint_id']} (iteration={latest_checkpoint.get('iteration', 0)})")
+        summary = latest_checkpoint.get("summary", {})
+        execution_loop = summary.get("execution_loop") or {}
+        provider_routing = summary.get("provider_routing") or {}
+        memory_context = summary.get("memory_context") or {}
+        if execution_loop:
+            print(f"Execution loop: phase={execution_loop.get('phase', 'unknown')} status={execution_loop.get('status', 'unknown')} stop_reason={execution_loop.get('stop_reason', 'unknown')} next_action={execution_loop.get('next_action', 'unknown')}")
+        if provider_routing:
+            print(f"Provider routing: provider={provider_routing.get('provider', 'unknown')} fallback_used={str(provider_routing.get('fallback_used', False)).lower()} reason={provider_routing.get('reason', 'unknown')}")
+        if memory_context:
+            print(f"Memory context: retrieval_topic={memory_context.get('retrieval_topic', 'unknown')} memory_count={memory_context.get('retrieved_count', 0)}")
+
     print("Tool activity: requested=%s invoked=%s failed=%s" % (tool_activity["requested"], tool_activity["invoked"], tool_activity["failed"]))
 
 
@@ -424,6 +465,17 @@ def command_run(args: argparse.Namespace) -> int:
         kernel.register_tool(tool)
     kernel.register_workflow_definition(workflow_definition)
     workflow_execution_id = kernel.start_workflow(workflow_definition.workflow_definition_id)
+
+    if args.dry_run:
+        workflow_name = data.get("name") or workflow_definition.name
+        print(f"Dry run preview for workflow '{workflow_name}'")
+        print(f"Workflow execution: {workflow_execution_id}")
+        print("No actions will be executed in dry-run mode.")
+        for step in workflow_definition.steps:
+            print(f"- planned step: {step.id} ({step.role})")
+        kernel.shutdown()
+        return 0
+
     model_adapter = ModelAdapterFactory.create(_build_model_config(args))
     try:
         execute_workflow(kernel, workflow_execution_id, model_adapter=model_adapter)
@@ -431,7 +483,7 @@ def command_run(args: argparse.Namespace) -> int:
         print(f"Execution failed: {exc}")
         kernel.shutdown()
         return 1
-    print_workflow_summary(kernel, workflow_execution_id)
+    print_workflow_summary(kernel, workflow_execution_id, data_dir=args.data_dir)
     kernel.shutdown()
     return 0
 
@@ -451,7 +503,7 @@ def command_resume(args: argparse.Namespace) -> int:
         print(f"Resume failed: {exc}")
         kernel.shutdown()
         return 1
-    print_workflow_summary(kernel, execution_id)
+    print_workflow_summary(kernel, execution_id, data_dir=args.data_dir)
     kernel.shutdown()
     return 0
 
@@ -482,6 +534,54 @@ def command_approve(args: argparse.Namespace) -> int:
     return 0
 
 
+def command_approval_list(args: argparse.Namespace) -> int:
+    service = RuntimeService(data_dir=args.data_dir)
+    try:
+        approvals = service.list_pending_tool_approvals(args.run_id)
+    finally:
+        service.shutdown()
+    if not approvals:
+        print("No pending tool approvals.")
+        return 0
+    print("Pending tool approvals:")
+    for approval in approvals:
+        print(
+            f"- {approval['approval_id']}: run={approval['run_id']} tool={approval['tool_id']} "
+            f"action={approval['action']} risk={approval['risk_level']}"
+        )
+        print(f"  parameters={json.dumps(approval['parameters'], sort_keys=True)}")
+    return 0
+
+
+def command_tool_approval_control(args: argparse.Namespace) -> int:
+    service = RuntimeService(data_dir=args.data_dir)
+    try:
+        if args.approval_command == "approve":
+            result = service.approve_tool_request(
+                args.run_id,
+                args.approval_id,
+                approved_by=args.actor,
+                reason=args.reason,
+                comment=args.comment,
+            )
+        else:
+            result = service.deny_tool_request(
+                args.run_id,
+                args.approval_id,
+                denied_by=args.actor,
+                reason=args.reason,
+                comment=args.comment,
+            )
+    finally:
+        service.shutdown()
+
+    if not result.get("accepted"):
+        print(f"Tool approval control failed: {result.get('message', 'unknown error')}")
+        return 1
+    print(f"Tool approval {args.approval_command}: {args.approval_id}")
+    return 0
+
+
 def command_status(args: argparse.Namespace) -> int:
     paths = resolve_data_paths(args.data_dir)
     kernel = RuntimeKernel(paths["event_db"], paths["artifact_db"], paths["workflow_definition_db"])
@@ -490,7 +590,7 @@ def command_status(args: argparse.Namespace) -> int:
         print(f"Workflow execution '{execution_id}' not found.")
         kernel.shutdown()
         return 1
-    print_workflow_summary(kernel, execution_id)
+    print_workflow_summary(kernel, execution_id, data_dir=args.data_dir)
     kernel.shutdown()
     return 0
 
@@ -554,6 +654,271 @@ def command_list_tools(args: argparse.Namespace) -> int:
     return 0
 
 
+def command_job_create(args: argparse.Namespace) -> int:
+    paths = resolve_data_paths(args.data_dir)
+    job_store = SQLiteJobStore(paths["event_db"].parent / "jobs.db")
+    scheduler = BackgroundScheduler(job_store)
+    job = scheduler.create_job(
+        args.task,
+        schedule=args.schedule,
+        runtime_budget_seconds=int(args.runtime_budget_seconds),
+    )
+    print(f"{job['job_id']}: {job['task']} status={job['status']} schedule={job['schedule']}")
+    job_store.close()
+    return 0
+
+
+def command_job_list(args: argparse.Namespace) -> int:
+    paths = resolve_data_paths(args.data_dir)
+    job_store = SQLiteJobStore(paths["event_db"].parent / "jobs.db")
+    jobs = job_store.connection.execute("SELECT job_id, task, status, schedule, runtime_budget_seconds, payload FROM jobs ORDER BY created_at ASC").fetchall()
+    if not jobs:
+        print("No persisted jobs.")
+        job_store.close()
+        return 0
+    print("Persisted jobs:")
+    for row in jobs:
+        payload = json.loads(row["payload"]) if row["payload"] else {}
+        print(f"- {row['job_id']}: {row['task']} schedule={row['schedule']} budget={row['runtime_budget_seconds']} {_format_job_status({'status': row['status'], 'payload': payload})}")
+    job_store.close()
+    return 0
+
+
+def command_job_get(args: argparse.Namespace) -> int:
+    paths = resolve_data_paths(args.data_dir)
+    job_store = SQLiteJobStore(paths["event_db"].parent / "jobs.db")
+    row = job_store.connection.execute(
+        "SELECT job_id, task, status, schedule, runtime_budget_seconds, payload FROM jobs WHERE job_id = ?",
+        (args.job_id,),
+    ).fetchone()
+    if row is None:
+        print(f"Job '{args.job_id}' not found.")
+        job_store.close()
+        return 1
+    payload = json.loads(row["payload"]) if row["payload"] else {}
+    print(f"job_id: {row['job_id']}")
+    print(f"task: {row['task']}")
+    print(f"status: {row['status']}")
+    print(f"schedule: {row['schedule']}")
+    print(f"budget: {row['runtime_budget_seconds']}")
+    print(_format_job_status({"status": row["status"], "payload": payload}))
+    if payload.get("execution_status"):
+        print(json.dumps(payload["execution_status"], indent=2, sort_keys=True))
+    else:
+        print(json.dumps(payload, indent=2, sort_keys=True))
+    job_store.close()
+    return 0
+
+
+def command_job_resume(args: argparse.Namespace) -> int:
+    paths = resolve_data_paths(args.data_dir)
+    job_store = SQLiteJobStore(paths["event_db"].parent / "jobs.db")
+    scheduler = BackgroundScheduler(job_store)
+    try:
+        resumed = scheduler.resume_job(
+            args.job_id,
+            executor=lambda payload: {
+                "status": "completed",
+                "summary": f"Resumed from {payload.get('resume_from')}",
+                "checkpoint": payload.get("resume_from"),
+                "resume_hint": {"can_resume": False},
+            },
+        )
+    except (KeyError, ValueError) as exc:
+        print(str(exc))
+        job_store.close()
+        return 1
+
+    print(f"Resumed job {args.job_id}: {resumed['summary']}")
+    print(_format_job_status({"status": resumed["status"], "payload": resumed.get("payload", {})}))
+    job_store.close()
+    return 0
+
+
+def command_memory_list(args: argparse.Namespace) -> int:
+    paths = resolve_data_paths(args.data_dir)
+    memory_store = SQLiteMemoryStore(paths["event_db"].parent / "memory.db", max_entries=50)
+    try:
+        memories = memory_store.list(topic=args.topic, limit=args.limit)
+        if not memories:
+            print("No persisted memories.")
+            return 0
+        print("Persisted memories:")
+        for memory in memories:
+            print(f"- {memory['memory_id']}: topic={memory['topic']} type={memory['entry_type']} source={memory['source']}")
+            print(f"  {memory['content']}")
+            if memory.get("metadata"):
+                print(f"  metadata={json.dumps(memory['metadata'], sort_keys=True)}")
+        return 0
+    finally:
+        memory_store.close()
+
+
+def command_memory_add(args: argparse.Namespace) -> int:
+    paths = resolve_data_paths(args.data_dir)
+    memory_store = SQLiteMemoryStore(paths["event_db"].parent / "memory.db", max_entries=50)
+    try:
+        metadata = {}
+        if args.metadata:
+            try:
+                metadata = json.loads(args.metadata)
+            except json.JSONDecodeError as exc:
+                print(f"Invalid metadata JSON: {exc}")
+                return 1
+        if not isinstance(metadata, dict):
+            print("Metadata must decode to a JSON object.")
+            return 1
+
+        memory = memory_store.add(
+            args.entry_type,
+            args.content,
+            args.topic,
+            args.source,
+            metadata=metadata,
+        )
+        print(f"Stored memory {memory['memory_id']}: topic={memory['topic']} type={memory['entry_type']}")
+        return 0
+    finally:
+        memory_store.close()
+
+
+def command_memory_recall(args: argparse.Namespace) -> int:
+    paths = resolve_data_paths(args.data_dir)
+    memory_store = SQLiteMemoryStore(paths["event_db"].parent / "memory.db", max_entries=50)
+    try:
+        memories = memory_store.list(topic=args.topic, limit=args.limit)
+        query_terms = [term.lower() for term in args.query.lower().split() if term]
+        filtered = []
+        for memory in memories:
+            text = f"{memory['content']} {json.dumps(memory.get('metadata', {}), sort_keys=True)}".lower()
+            if all(term in text for term in query_terms):
+                filtered.append(memory)
+        if not filtered:
+            print("No matching memories.")
+            return 0
+        print("Matching memories:")
+        for memory in filtered:
+            print(f"- {memory['memory_id']}: topic={memory['topic']} type={memory['entry_type']} source={memory['source']}")
+            print(f"  {memory['content']}")
+            if memory.get("metadata"):
+                print(f"  metadata={json.dumps(memory['metadata'], sort_keys=True)}")
+        return 0
+    finally:
+        memory_store.close()
+
+
+def command_checkpoint_list(args: argparse.Namespace) -> int:
+    service = RuntimeService(data_dir=args.data_dir)
+    try:
+        checkpoints = service.list_checkpoints()
+        if not checkpoints:
+            print("No persisted checkpoints.")
+            return 0
+        print("Persisted checkpoints:")
+        for checkpoint in checkpoints:
+            summary = checkpoint.get("summary", {})
+            progress = checkpoint.get("progress_summary") or {}
+            task = summary.get("task") or checkpoint.get("last_action") or "<unknown>"
+            phase = progress.get("phase", "unknown")
+            stop_reason = progress.get("stop_reason", "unknown")
+            status = checkpoint.get("execution_summary", {}).get("status", "UNKNOWN")
+            print(f"- {checkpoint['checkpoint_id']}: task={task} iteration={checkpoint.get('iteration', 0)} status={status} phase={phase} stop_reason={stop_reason}")
+        return 0
+    finally:
+        service.shutdown()
+
+
+def command_checkpoint_get(args: argparse.Namespace) -> int:
+    service = RuntimeService(data_dir=args.data_dir)
+    try:
+        checkpoint = service.get_checkpoint(args.checkpoint_id)
+        if checkpoint is None:
+            print(f"Checkpoint '{args.checkpoint_id}' not found.")
+            return 1
+
+        progress = checkpoint.get("progress_summary") or {}
+        summary = checkpoint.get("summary", {})
+        execution_loop = summary.get("execution_loop") or progress
+        provider_routing = summary.get("provider_routing") or {}
+        memory_context = summary.get("memory_context") or {}
+
+        print(f"Checkpoint: {checkpoint['checkpoint_id']}")
+        print(f"  task={progress.get('task') or summary.get('task') or '<unknown>'}")
+        print(f"  iteration={checkpoint.get('iteration', 0)} status={progress.get('status', 'unknown')} phase={progress.get('phase', 'unknown')}")
+        print(f"  stop_reason={progress.get('stop_reason', 'unknown')}")
+        print(f"  next_action={progress.get('next_action', 'unknown')}")
+        if provider_routing:
+            print(f"  provider={provider_routing.get('provider', 'unknown')} fallback_used={str(provider_routing.get('fallback_used', False)).lower()}")
+        if memory_context:
+            print(f"  memory_count={memory_context.get('retrieved_count', 0)} retrieval_topic={memory_context.get('retrieval_topic', 'unknown')}")
+        if execution_loop:
+            print(f"  verification_status={execution_loop.get('verification_status', 'unknown')}")
+        return 0
+    finally:
+        service.shutdown()
+
+
+def command_rollback(args: argparse.Namespace) -> int:
+    service = RuntimeService(data_dir=args.data_dir)
+    try:
+        result = service.rollback_checkpoint(args.checkpoint_id, actor=args.actor, reason=args.reason)
+    finally:
+        service.shutdown()
+
+    if result["status"] == "ROLLED_BACK":
+        paths = result.get("paths") or ([result["path"]] if result.get("path") else [])
+        print(f"Rolled back checkpoint {args.checkpoint_id}: {', '.join(paths)}")
+        return 0
+    print(f"Rollback {result['status'].lower()}: {result.get('reason', 'unknown reason')}")
+    return 1
+
+
+def command_change_get(args: argparse.Namespace) -> int:
+    service = RuntimeService(data_dir=args.data_dir)
+    try:
+        change = service.get_change_record(args.checkpoint_id)
+    finally:
+        service.shutdown()
+    if change is None:
+        print(f"Change record for checkpoint '{args.checkpoint_id}' not found.")
+        return 1
+    patch_result = change.get("patch_result") or {}
+    print(f"Change record: {change['checkpoint_id']}")
+    print(f"  task={change.get('task') or '<unknown>'}")
+    print(f"  applied={str(patch_result.get('applied', False)).lower()} reason={patch_result.get('reason', 'unknown')}")
+    changes = patch_result.get("changes") or [patch_result]
+    for item in changes:
+        print(f"  path={item.get('path', '<unknown>')}")
+        print(f"    before_hash={item.get('before_hash', 'unknown')} after_hash={item.get('after_hash', 'unknown')}")
+        if item.get("diff"):
+            print("    diff:")
+            for line in str(item["diff"]).splitlines():
+                print(f"      {line}")
+    verification = change.get("verification") or {}
+    print(f"  verification={verification.get('status', 'unknown')}")
+    if change.get("rollback"):
+        print(f"  rollback={json.dumps(change['rollback'], sort_keys=True)}")
+    return 0
+
+
+def command_policy_denials(args: argparse.Namespace) -> int:
+    service = RuntimeService(data_dir=args.data_dir)
+    try:
+        denials = service.list_policy_denials(args.run_id)
+    finally:
+        service.shutdown()
+    if not denials:
+        print("No policy denials.")
+        return 0
+    print("Policy denials:")
+    for denial in denials:
+        print(
+            f"- {denial['event_id']}: run={denial['run_id']} tool={denial.get('tool_id') or 'unknown'} "
+            f"action={denial.get('action') or 'unknown'} reason={denial.get('reason') or 'unknown'}"
+        )
+    return 0
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     parent_parser = argparse.ArgumentParser(add_help=False)
     parent_parser.add_argument("--data-dir", help="Directory for Hermes runtime persistence", default=None)
@@ -570,18 +935,32 @@ def main(argv: Optional[List[str]] = None) -> int:
     run_parser.add_argument("--provider", help="Model adapter provider (stub or ollama)", default="stub")
     run_parser.add_argument("--model-name", help="Model name to use for the adapter", default=None)
     run_parser.add_argument("--endpoint", help="Remote endpoint for adapter providers", default=None)
+    run_parser.add_argument("--dry-run", action="store_true", help="Preview workflow actions without executing them")
 
     resume_parser = subparsers.add_parser("resume", parents=[parent_parser], help="Resume a persisted workflow execution")
     resume_parser.add_argument("workflow_execution_id", help="Workflow execution id")
     resume_parser.add_argument("--provider", help="Model adapter provider (stub or ollama)", default="stub")
     resume_parser.add_argument("--model-name", help="Model name to use for the adapter", default=None)
     resume_parser.add_argument("--endpoint", help="Remote endpoint for adapter providers", default=None)
+    resume_parser.add_argument("--dry-run", action="store_true", help="Preview workflow resume actions without executing them")
 
     approve_parser = subparsers.add_parser("approve", parents=[parent_parser], help="Approve a waiting workflow execution")
     approve_parser.add_argument("workflow_execution_id", help="Workflow execution id")
     approve_parser.add_argument("--approved-by", help="Approver identifier", default="cli-user")
     approve_parser.add_argument("--reason", help="Approval reason", default="approved")
     approve_parser.add_argument("--comment", help="Approval comment", default=None)
+
+    approval_parser = subparsers.add_parser("approval", parents=[parent_parser], help="Inspect pending tool approvals")
+    approval_subparsers = approval_parser.add_subparsers(dest="approval_command", required=True)
+    approval_list_parser = approval_subparsers.add_parser("list", parents=[parent_parser], help="List pending tool approvals")
+    approval_list_parser.add_argument("--run-id", help="Limit results to one run", default=None)
+    for approval_action in ("approve", "deny"):
+        control_parser = approval_subparsers.add_parser(approval_action, parents=[parent_parser], help=f"{approval_action.title()} a pending tool approval")
+        control_parser.add_argument("run_id", help="Run identifier")
+        control_parser.add_argument("approval_id", help="Pending tool approval identifier")
+        control_parser.add_argument("--actor", default="cli-user", help="Actor making the decision")
+        control_parser.add_argument("--reason", default=approval_action, help="Decision reason")
+        control_parser.add_argument("--comment", default=None, help="Optional decision comment")
 
     status_parser = subparsers.add_parser("status", parents=[parent_parser], help="Show status for a workflow execution")
     status_parser.add_argument("workflow_execution_id", help="Workflow execution id")
@@ -594,6 +973,55 @@ def main(argv: Optional[List[str]] = None) -> int:
     list_subparsers.add_parser("workflows", parents=[parent_parser], help="List persisted workflow definitions")
     list_subparsers.add_parser("executions", parents=[parent_parser], help="List persisted workflow executions")
     list_subparsers.add_parser("tools", parents=[parent_parser], help="List persisted tools")
+
+    job_parser = subparsers.add_parser("job", parents=[parent_parser], help="Manage background jobs")
+    job_subparsers = job_parser.add_subparsers(dest="job_command", required=True)
+    job_create_parser = job_subparsers.add_parser("create", parents=[parent_parser], help="Create a background job")
+    job_create_parser.add_argument("task", help="Task description for the job")
+    job_create_parser.add_argument("--schedule", help="Schedule for the job", default="manual")
+    job_create_parser.add_argument("--runtime-budget-seconds", help="Maximum runtime budget for the job", default="60")
+    job_subparsers.add_parser("list", parents=[parent_parser], help="List persisted background jobs")
+    job_get_parser = job_subparsers.add_parser("get", parents=[parent_parser], help="Show a persisted background job")
+    job_get_parser.add_argument("job_id", help="Job identifier")
+    job_resume_parser = job_subparsers.add_parser("resume", parents=[parent_parser], help="Resume a persisted background job")
+    job_resume_parser.add_argument("job_id", help="Job identifier")
+
+    memory_parser = subparsers.add_parser("memory", parents=[parent_parser], help="Inspect persisted memory entries")
+    memory_subparsers = memory_parser.add_subparsers(dest="memory_command", required=True)
+    memory_list_parser = memory_subparsers.add_parser("list", parents=[parent_parser], help="List persisted memories")
+    memory_list_parser.add_argument("--topic", help="Filter memory entries by topic", default=None)
+    memory_list_parser.add_argument("--limit", help="Maximum number of memories to return", type=int, default=10)
+    memory_add_parser = memory_subparsers.add_parser("add", parents=[parent_parser], help="Store a new memory entry")
+    memory_add_parser.add_argument("entry_type", help="Memory entry type", default="lesson")
+    memory_add_parser.add_argument("content", help="Memory content to persist")
+    memory_add_parser.add_argument("--topic", help="Topic for the memory", default="default")
+    memory_add_parser.add_argument("--source", help="Source of the memory", default="cli")
+    memory_add_parser.add_argument("--metadata", help="Optional JSON metadata object", default=None)
+    memory_recall_parser = memory_subparsers.add_parser("recall", parents=[parent_parser], help="Recall persisted memories by query")
+    memory_recall_parser.add_argument("query", help="Keyword or phrase to search for")
+    memory_recall_parser.add_argument("--topic", help="Filter memory entries by topic", default=None)
+    memory_recall_parser.add_argument("--limit", help="Maximum number of memories to inspect", type=int, default=10)
+
+    checkpoint_parser = subparsers.add_parser("checkpoint", parents=[parent_parser], help="Inspect persisted checkpoints")
+    checkpoint_subparsers = checkpoint_parser.add_subparsers(dest="checkpoint_command", required=True)
+    checkpoint_subparsers.add_parser("list", parents=[parent_parser], help="List persisted checkpoints")
+    checkpoint_get_parser = checkpoint_subparsers.add_parser("get", parents=[parent_parser], help="Show a persisted checkpoint")
+    checkpoint_get_parser.add_argument("checkpoint_id", help="Checkpoint identifier")
+
+    rollback_parser = subparsers.add_parser("rollback", parents=[parent_parser], help="Rollback an applied task edit from a checkpoint")
+    rollback_parser.add_argument("checkpoint_id", help="Checkpoint identifier")
+    rollback_parser.add_argument("--actor", default="cli-user", help="Actor performing the rollback")
+    rollback_parser.add_argument("--reason", default="rollback requested from CLI", help="Reason for the rollback")
+
+    change_parser = subparsers.add_parser("change", parents=[parent_parser], help="Inspect persisted task change records")
+    change_subparsers = change_parser.add_subparsers(dest="change_command", required=True)
+    change_get_parser = change_subparsers.add_parser("get", parents=[parent_parser], help="Show a task change record")
+    change_get_parser.add_argument("checkpoint_id", help="Checkpoint identifier")
+
+    policy_parser = subparsers.add_parser("policy", parents=[parent_parser], help="Inspect policy decisions")
+    policy_subparsers = policy_parser.add_subparsers(dest="policy_command", required=True)
+    denial_parser = policy_subparsers.add_parser("denials", parents=[parent_parser], help="List policy-denied actions")
+    denial_parser.add_argument("--run-id", help="Limit results to one run", default=None)
 
     args = parser.parse_args(argv)
     if args.version:
@@ -611,6 +1039,10 @@ def main(argv: Optional[List[str]] = None) -> int:
             return command_resume(args)
         if args.command == "approve":
             return command_approve(args)
+        if args.command == "approval" and args.approval_command == "list":
+            return command_approval_list(args)
+        if args.command == "approval" and args.approval_command in {"approve", "deny"}:
+            return command_tool_approval_control(args)
         if args.command == "status":
             return command_status(args)
         if args.command == "artifacts":
@@ -622,6 +1054,33 @@ def main(argv: Optional[List[str]] = None) -> int:
                 return command_list_executions(args)
             if args.list_command == "tools":
                 return command_list_tools(args)
+        if args.command == "job":
+            if args.job_command == "create":
+                return command_job_create(args)
+            if args.job_command == "list":
+                return command_job_list(args)
+            if args.job_command == "get":
+                return command_job_get(args)
+            if args.job_command == "resume":
+                return command_job_resume(args)
+        if args.command == "memory":
+            if args.memory_command == "list":
+                return command_memory_list(args)
+            if args.memory_command == "add":
+                return command_memory_add(args)
+            if args.memory_command == "recall":
+                return command_memory_recall(args)
+        if args.command == "checkpoint":
+            if args.checkpoint_command == "list":
+                return command_checkpoint_list(args)
+            if args.checkpoint_command == "get":
+                return command_checkpoint_get(args)
+        if args.command == "rollback":
+            return command_rollback(args)
+        if args.command == "change" and args.change_command == "get":
+            return command_change_get(args)
+        if args.command == "policy" and args.policy_command == "denials":
+            return command_policy_denials(args)
     except ValueError as exc:
         print(f"Validation error: {exc}")
         return 1

@@ -5,6 +5,7 @@ from pathlib import Path
 from engine.models import Artifact, StepDefinition, WorkflowDefinition
 from engine.runner import RuntimeRunner
 from engine.runtime import RuntimeKernel
+from engine.scheduler import BackgroundScheduler, LocalLeaseLockBackend, SQLiteJobStore
 
 
 class TestScheduler(unittest.TestCase):
@@ -259,6 +260,39 @@ class TestScheduler(unittest.TestCase):
             self.assertIsNotNone(next_step_id)
             self.assertEqual(kernel.step_executions[next_step_id].step_id, "developer-1")
             kernel.shutdown()
+
+    def test_scheduler_accepts_an_injected_lock_backend(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            job_store = SQLiteJobStore(Path(temp_dir) / "jobs.db")
+
+            class RecordingLockBackend(LocalLeaseLockBackend):
+                def __init__(self, root_path):
+                    super().__init__(root_path)
+                    self.acquisitions = []
+                    self.releases = []
+
+                def acquire(self, job_id, owner_id, lease_seconds=60):
+                    self.acquisitions.append((job_id, owner_id, lease_seconds))
+                    return super().acquire(job_id, owner_id, lease_seconds=lease_seconds)
+
+                def release(self, job_id, owner_id):
+                    self.releases.append((job_id, owner_id))
+                    return super().release(job_id, owner_id)
+
+            backend = RecordingLockBackend(Path(temp_dir))
+            scheduler = BackgroundScheduler(job_store, lock_backend=backend)
+            job = scheduler.create_job("run a maintenance task", runtime_budget_seconds=5)
+
+            result = scheduler.start_job(
+                job["job_id"],
+                lambda payload: {"status": "COMPLETED", "task_status": "COMPLETED_VERIFIED", "status_schema_version": 1, "summary": {"ok": True}},
+            )
+
+            self.assertEqual(result["execution_status"]["status"], "COMPLETED")
+            self.assertEqual(backend.acquisitions[0][0], job["job_id"])
+            self.assertEqual(backend.releases[0][0], job["job_id"])
+            self.assertEqual(result["execution_status"]["lock"]["owner_id"], backend.acquisitions[0][1])
+            job_store.close()
 
     def test_scheduler_cannot_schedule_after_workflow_complete(self):
         with tempfile.TemporaryDirectory() as temp_dir:

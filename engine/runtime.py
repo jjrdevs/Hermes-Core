@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import hashlib
 from pathlib import Path
 import traceback
 from typing import Any, Dict, List, Optional
@@ -24,6 +26,7 @@ from .storage import SQLiteArtifactStore, SQLiteEventLog, SQLiteToolStore, SQLit
 from .scheduler import Scheduler
 from .tools import ToolRegistry
 from .capability import CapabilityRegistry, CapabilityResolver
+from .metrics import MetricsSink
 
 
 class RuntimeKernel:
@@ -46,11 +49,28 @@ class RuntimeKernel:
         self.policy_evaluator = PolicyEvaluator()
         self.capability_registry = CapabilityRegistry()
         self.capability_registry.register_default_workers()
+        self.metrics: Optional[MetricsSink] = None
+        self._load_capability_packages()
         self.tool_registry = ToolRegistry()
         self.tool_store = SQLiteToolStore(event_db_path.parent / "tools.db")
         self._load_definitions()
         self._load_tools()
         self._load_state()
+
+    def _load_capability_packages(self) -> None:
+        package_root = Path(__file__).resolve().parents[1] / "capabilities"
+        if not package_root.exists():
+            return
+
+        for capability_dir in sorted(package_root.iterdir()):
+            if not capability_dir.is_dir():
+                continue
+            capability_file = capability_dir / "capability.json"
+            if not capability_file.exists():
+                continue
+            with capability_file.open("r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+            self.capability_registry.register(payload.get("capability") or capability_dir.name, payload)
 
     def _load_definitions(self) -> None:
         for workflow_definition in self.workflow_definition_store.list():
@@ -247,16 +267,46 @@ class RuntimeKernel:
             workflow_execution.status = "COMPLETED"
             workflow_execution.completed_at = payload["completed_at"]
             workflow_execution.events.append(event.event_id)
-        elif event.event_type == "APPROVAL_REQUIRED":
+        elif event.event_type in {"APPROVAL_REQUIRED", "TOOL_APPROVAL_REQUIRED"}:
             payload = event.payload
-            workflow_execution = self.workflow_executions[payload["execution_id"]]
+            workflow_execution_id = payload.get("workflow_execution_id") or payload.get("execution_id")
+            if workflow_execution_id is None and event.execution_id in self.step_executions:
+                workflow_execution_id = self.step_executions[event.execution_id].workflow_id
+            if workflow_execution_id is None:
+                raise KeyError(f"Unable to resolve workflow execution for approval event {event.event_id}")
+            workflow_execution = self.workflow_executions[workflow_execution_id]
             workflow_execution.status = "WAITING_APPROVAL"
             workflow_execution.events.append(event.event_id)
-        elif event.event_type == "APPROVAL_GRANTED":
+        elif event.event_type in {"APPROVAL_GRANTED", "TOOL_APPROVAL_GRANTED"}:
             payload = event.payload
-            workflow_execution = self.workflow_executions[payload["execution_id"]]
+            workflow_execution_id = payload.get("workflow_execution_id") or payload.get("execution_id")
+            if workflow_execution_id is None and event.execution_id in self.step_executions:
+                workflow_execution_id = self.step_executions[event.execution_id].workflow_id
+            if workflow_execution_id is None:
+                raise KeyError(f"Unable to resolve workflow execution for approval granted event {event.event_id}")
+            workflow_execution = self.workflow_executions[workflow_execution_id]
             if workflow_execution.status == "WAITING_APPROVAL":
                 workflow_execution.status = "EXECUTING"
+            workflow_execution.events.append(event.event_id)
+        elif event.event_type == "TOOL_APPROVAL_DENIED":
+            payload = event.payload
+            workflow_execution_id = payload.get("workflow_execution_id") or payload.get("execution_id")
+            execution = self.step_executions.get(payload.get("step_execution_id") or event.execution_id)
+            if workflow_execution_id is None and execution is not None:
+                workflow_execution_id = execution.workflow_id
+            if workflow_execution_id is None:
+                raise KeyError(f"Unable to resolve workflow execution for tool approval denied event {event.event_id}")
+            workflow_execution = self.workflow_executions[workflow_execution_id]
+            if execution is not None:
+                execution.status = "FAILED"
+                execution.completed_at = payload.get("denied_at")
+                if execution.execution_id in workflow_execution.active_executions:
+                    workflow_execution.active_executions.remove(execution.execution_id)
+                if execution.execution_id not in workflow_execution.failed_executions:
+                    workflow_execution.failed_executions.append(execution.execution_id)
+                execution.events.append(event.event_id)
+            workflow_execution.status = "FAILED"
+            workflow_execution.completed_at = payload.get("denied_at")
             workflow_execution.events.append(event.event_id)
         elif event.event_type == "WORKFLOW_FAILED":
             payload = event.payload
@@ -295,6 +345,7 @@ class RuntimeKernel:
         self,
         workflow_definition_id: str,
         execution_context: Optional[ExecutionContext] = None,
+        policy_context: Optional[Dict[str, Any]] = None,
     ) -> str:
         workflow_definition = self.workflow_definitions[workflow_definition_id]
         execution_context = execution_context or ExecutionContext.default()
@@ -304,6 +355,7 @@ class RuntimeKernel:
             definition_version=workflow_definition.definition_version,
             definition_hash=workflow_definition.compute_definition_hash(),
             execution_context=execution_context,
+            policy_context=policy_context,
         )
         event = Event.create(
             event_type="WORKFLOW_CREATED",
@@ -334,6 +386,7 @@ class RuntimeKernel:
         if transition_action is not None:
             if transition_action["type"] == "require_approval":
                 if self.approval_already_granted(workflow_execution_id):
+                    # Approval has already been granted; continue to the next ready step.
                     pass
                 else:
                     self._emit_approval_required(workflow_execution_id, transition_action)
@@ -421,6 +474,7 @@ class RuntimeKernel:
                 "capability_required": execution.capability_required,
                 "status": execution.status,
                 "created_at": execution.created_at,
+                "policy_context": workflow_execution.policy_context,
             },
         )
         self.event_log.append(event)
@@ -558,6 +612,65 @@ class RuntimeKernel:
         self.event_log.append(event)
         self._apply_event(event)
 
+    @staticmethod
+    def _tool_request_fingerprint(tool_id: str, action: str, parameters: Dict[str, Any]) -> str:
+        payload = json.dumps(
+            {"tool_id": tool_id, "action": action, "parameters": parameters},
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    def _tool_approval_state(self, workflow_execution: WorkflowExecution, approval_id: str, fingerprint: str) -> str:
+        state = "none"
+        for event_id in workflow_execution.events:
+            event = self.event_log.get(event_id)
+            if event is None:
+                continue
+            payload = event.payload or {}
+            if payload.get("approval_id") != approval_id or payload.get("request_fingerprint") != fingerprint:
+                continue
+            if event.event_type == "TOOL_APPROVAL_REQUIRED":
+                state = "pending"
+            elif event.event_type == "TOOL_APPROVAL_GRANTED":
+                state = "granted"
+            elif event.event_type == "TOOL_APPROVAL_DENIED":
+                state = "denied"
+        return state
+
+    def _emit_tool_approval_required(
+        self,
+        execution_id: str,
+        tool_id: str,
+        action: str,
+        parameters: Dict[str, Any],
+        risk_level: str,
+        approval_id: str,
+        request_fingerprint: str,
+    ) -> None:
+        execution = self.step_executions[execution_id]
+        event = Event.create(
+            event_type="TOOL_APPROVAL_REQUIRED",
+            workflow_id=execution.workflow_id,
+            execution_id=execution.execution_id,
+            payload={
+                "execution_id": execution.execution_id,
+                "workflow_execution_id": execution.workflow_id,
+                "step_execution_id": execution.execution_id,
+                "approval_id": approval_id,
+                "request_fingerprint": request_fingerprint,
+                "tool_id": tool_id,
+                "action": action,
+                "parameters": parameters,
+                "risk_level": risk_level,
+                "requested_at": _now_iso(),
+                "reason": "tool.risk_requires_approval",
+            },
+        )
+        self.event_log.append(event)
+        self._apply_event(event)
+
     def assign_execution(
         self,
         execution_id: str,
@@ -651,19 +764,52 @@ class RuntimeKernel:
             self._emit_tool_failed(execution_id, tool_id, action, "tool_registry.tool_not_found")
             return PolicyDecision(False, "tool_registry.tool_not_found")
 
+        tool_metadata = dict(tool.metadata or {})
+        execution_context = workflow_execution.execution_context or ExecutionContext.default()
+        capability_contract = execution_context.capability_contract or {}
+        if isinstance(capability_contract, dict) and capability_contract:
+            tool_metadata["capability_contract"] = dict(capability_contract)
+            if tool_id == "filesystem":
+                tool_metadata.setdefault("allowed_roots", list(capability_contract.get("allowed_roots") or []))
+            if tool_id == "shell":
+                tool_metadata.setdefault("allowed_cwds", [str(root) for root in capability_contract.get("allowed_roots") or []])
+                tool_metadata.setdefault("allowed_env_keys", list(capability_contract.get("allowed_env_keys") or []))
+
+        tool_constraints = {
+            "command": parameters.get("command"),
+            "allowed_commands": tool_metadata.get("allowed_commands", []),
+            "allowed_actions": tool_metadata.get("allowed_actions", []),
+            "cwd": parameters.get("cwd"),
+            "env": parameters.get("env"),
+            "path": parameters.get("path"),
+            "source": parameters.get("source"),
+            "destination": parameters.get("destination"),
+        }
+        tool_capabilities = []
+        if tool_id == "filesystem":
+            tool_capabilities = ["workspace_inspection", "repo_editing"]
+        elif tool_id == "shell":
+            tool_capabilities = ["workspace_execution"]
+        elif tool_id == "git":
+            tool_capabilities = ["repo_editing"]
+
         policy_context = {
             "tool_id": tool_id,
             "tool_action": action,
+            "tool_risk_level": tool.risk_level_for_action(action),
             "policy_context": execution.policy_context,
-            "tool_constraints": {
-                "command": parameters.get("command"),
-                "allowed_commands": (tool.metadata or {}).get("allowed_commands", []),
-                "allowed_actions": (tool.metadata or {}).get("allowed_actions", []),
-            },
+            "tool_constraints": tool_constraints,
+            "sandbox_profile": execution_context.sandbox_profile,
+            "capability_contract": capability_contract,
+            "capability_requirements": [],
+            "tool_capabilities": tool_capabilities,
         }
-        decision = self._evaluate_execution_policy(
-            execution_id,
-            "invoke_tool",
+        decision = self.policy_evaluator.evaluate_tool_request(
+            tool_id=tool_id,
+            tool_action=action,
+            policy_context=execution.policy_context,
+            step_constraints=step_definition.constraints,
+            tool_constraints=tool_constraints,
             extra_context=policy_context,
         )
         if not decision.allowed:
@@ -673,6 +819,24 @@ class RuntimeKernel:
         if not self.tool_registry.authorize(execution.capability_required, tool_id, action):
             self._emit_tool_failed(execution_id, tool_id, action, "tool_registry.unauthorized")
             return PolicyDecision(False, "tool_registry.unauthorized")
+
+        risk_level = tool.risk_level_for_action(action)
+        if risk_level in {"destructive", "privileged", "external_network"}:
+            request_fingerprint = self._tool_request_fingerprint(tool_id, action, parameters)
+            approval_id = f"tool-approval-{request_fingerprint[:16]}"
+            approval_state = self._tool_approval_state(workflow_execution, approval_id, request_fingerprint)
+            if approval_state != "granted":
+                if approval_state == "none":
+                    self._emit_tool_approval_required(
+                        execution_id,
+                        tool_id,
+                        action,
+                        parameters,
+                        risk_level,
+                        approval_id,
+                        request_fingerprint,
+                    )
+                return PolicyDecision(False, "tool_approval_required")
 
         request_event = Event.create(
             event_type="TOOL_REQUESTED",
@@ -684,11 +848,13 @@ class RuntimeKernel:
                 "step_execution_id": execution.execution_id,
                 "tool_id": tool_id,
                 "action": action,
+                "risk_level": risk_level,
                 "parameters": parameters,
                 "policy_decision": {
                     "allowed": decision.allowed,
                     "reason": decision.reason,
                 },
+                "risk_level": risk_level,
             },
         )
         self.event_log.append(request_event)
@@ -734,6 +900,99 @@ class RuntimeKernel:
         self.event_log.append(invoke_event)
         self._apply_event(invoke_event)
         return decision
+
+    def approve_tool_request(
+        self,
+        execution_id: str,
+        approval_id: str,
+        *,
+        approved_by: str,
+        reason: str = "approved",
+        comment: Optional[str] = None,
+    ) -> PolicyDecision:
+        execution = self.step_executions[execution_id]
+        workflow_execution = self.workflow_executions[execution.workflow_id]
+        pending_event = None
+        for event_id in reversed(workflow_execution.events):
+            event = self.event_log.get(event_id)
+            if event is not None and event.event_type == "TOOL_APPROVAL_REQUIRED" and event.payload.get("approval_id") == approval_id:
+                pending_event = event
+                break
+        if pending_event is None:
+            return PolicyDecision(False, "tool_approval_not_found")
+
+        request_fingerprint = pending_event.payload.get("request_fingerprint")
+        if self._tool_approval_state(workflow_execution, approval_id, request_fingerprint) != "pending":
+            return PolicyDecision(False, "tool_approval_not_pending")
+
+        event = Event.create(
+            event_type="TOOL_APPROVAL_GRANTED",
+            workflow_id=workflow_execution.workflow_id,
+            execution_id=workflow_execution.execution_id,
+            payload={
+                "execution_id": workflow_execution.execution_id,
+                "approval_id": approval_id,
+                "request_fingerprint": request_fingerprint,
+                "tool_id": pending_event.payload.get("tool_id"),
+                "action": pending_event.payload.get("action"),
+                "risk_level": pending_event.payload.get("risk_level"),
+                "approved_by": approved_by,
+                "reason": reason,
+                "comment": comment,
+                "approved_at": _now_iso(),
+                "approval_required_event_id": pending_event.event_id,
+            },
+        )
+        self.event_log.append(event)
+        self._apply_event(event)
+        return PolicyDecision(True, "tool_approval_granted")
+
+    def deny_tool_request(
+        self,
+        execution_id: str,
+        approval_id: str,
+        *,
+        denied_by: str,
+        reason: str = "denied",
+        comment: Optional[str] = None,
+    ) -> PolicyDecision:
+        execution = self.step_executions[execution_id]
+        workflow_execution = self.workflow_executions[execution.workflow_id]
+        pending_event = None
+        for event_id in reversed(workflow_execution.events):
+            event = self.event_log.get(event_id)
+            if event is not None and event.event_type == "TOOL_APPROVAL_REQUIRED" and event.payload.get("approval_id") == approval_id:
+                pending_event = event
+                break
+        if pending_event is None:
+            return PolicyDecision(False, "tool_approval_not_found")
+
+        request_fingerprint = pending_event.payload.get("request_fingerprint")
+        if self._tool_approval_state(workflow_execution, approval_id, request_fingerprint) != "pending":
+            return PolicyDecision(False, "tool_approval_not_pending")
+
+        event = Event.create(
+            event_type="TOOL_APPROVAL_DENIED",
+            workflow_id=workflow_execution.workflow_id,
+            execution_id=workflow_execution.execution_id,
+            payload={
+                "execution_id": workflow_execution.execution_id,
+                "step_execution_id": execution_id,
+                "approval_id": approval_id,
+                "request_fingerprint": request_fingerprint,
+                "tool_id": pending_event.payload.get("tool_id"),
+                "action": pending_event.payload.get("action"),
+                "risk_level": pending_event.payload.get("risk_level"),
+                "denied_by": denied_by,
+                "reason": reason,
+                "comment": comment,
+                "denied_at": _now_iso(),
+                "approval_required_event_id": pending_event.event_id,
+            },
+        )
+        self.event_log.append(event)
+        self._apply_event(event)
+        return PolicyDecision(False, "tool_approval_denied")
 
     def start_execution(self, execution_id: str) -> PolicyDecision:
         decision = self._evaluate_execution_policy(execution_id, "start_step")
@@ -814,6 +1073,11 @@ class RuntimeKernel:
         self._apply_event(event)
 
     def shutdown(self) -> None:
+        try:
+            if self.metrics is not None:
+                self.metrics.close()
+        except Exception:
+            pass
         self.event_log.close()
         self.artifact_store.close()
         self.tool_store.close()

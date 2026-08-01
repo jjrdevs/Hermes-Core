@@ -93,6 +93,35 @@ class TestHermesHttpAdapter(unittest.TestCase):
             finally:
                 adapter.shutdown()
 
+    def test_adapter_surfaces_run_summary_for_observation_requests(self):
+        workflow_path = Path(__file__).resolve().parent.parent / "examples" / "approval_example.json"
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            adapter = HermesHttpAdapter(data_dir=temp_dir, enabled=True)
+            try:
+                started = adapter.handle({"action": "start_run", "workflow_path": str(workflow_path), "context": {"execution_mode": "manual"}})
+                observed = adapter.handle({"action": "observe_run", "run_id": started["run_id"]})
+
+                self.assertIn("summary", observed)
+                self.assertEqual(observed["summary"]["status"], "WAITING_APPROVAL")
+                self.assertEqual(observed["summary"]["pending_approval_role"], "human_operator")
+            finally:
+                adapter.shutdown()
+
+    def test_adapter_exposes_checkpoint_inspection_actions(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            adapter = HermesHttpAdapter(data_dir=temp_dir, enabled=True)
+            try:
+                adapter.api.service.run_task("inspect the repository", workspace_path=temp_dir)
+                checkpoints = adapter.handle({"action": "list_checkpoints"})
+                self.assertTrue(checkpoints)
+
+                first = checkpoints[0]
+                loaded = adapter.handle({"action": "get_checkpoint", "checkpoint_id": first["checkpoint_id"]})
+                self.assertEqual(loaded["checkpoint_id"], first["checkpoint_id"])
+            finally:
+                adapter.shutdown()
+
 
 if __name__ == "__main__":
     unittest.main()

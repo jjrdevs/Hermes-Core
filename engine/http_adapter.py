@@ -47,6 +47,10 @@ class HermesHttpAdapter:
             if not self.enabled:
                 return {"accepted": False, "status": "disabled", "message": f"{action} is disabled for the legacy adapter"}
             return self.api.get_run_artifacts(payload["run_id"])
+        if action == "list_checkpoints":
+            return self.api.list_checkpoints()
+        if action == "get_checkpoint":
+            return self.api.get_checkpoint(payload["checkpoint_id"])
         if action in {"cancel_run", "cancel"}:
             if not self.enabled:
                 return {"accepted": False, "status": "disabled", "message": f"{action} is disabled for the legacy adapter"}

@@ -30,6 +30,18 @@ python3 hermes_cli.py approve <workflow_execution_id> --data-dir /tmp/hermes_dat
 python3 hermes_cli.py resume <workflow_execution_id> --data-dir /tmp/hermes_data
 ```
 
+Preview a workflow without executing its steps:
+
+```bash
+python3 hermes_cli.py run examples/design_review_workflow.json --dry-run --data-dir /tmp/hermes_data
+```
+
+Rollback an applied task edit from a checkpoint:
+
+```bash
+python3 hermes_cli.py rollback <checkpoint_id> --data-dir /tmp/hermes_data
+```
+
 5. List persisted runtime assets:
 
 ```bash
@@ -65,8 +77,10 @@ Supported commands:
 
 - `validate <workflow.json>`: Validate workflow JSON structure.
 - `run <workflow.json>`: Start a new persisted workflow execution.
+- `run <workflow.json> --dry-run`: Preview planned workflow steps without executing them.
 - `resume <workflow_execution_id>`: Resume a persisted execution.
 - `approve <workflow_execution_id>`: Approve a workflow paused for approval.
+- `rollback <checkpoint_id>`: Restore the file state recorded before a checkpointed task edit.
 - `status <workflow_execution_id>`: Show human-readable workflow status.
 - `artifacts <workflow_execution_id>`: Show produced artifacts.
 - `list workflows`: List persisted workflow definitions.

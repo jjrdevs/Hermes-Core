@@ -1,0 +1,29 @@
+groups:
+  - name: hermes.rules
+    rules:
+      - alert: ProviderCircuitOpen
+        expr: provider_circuit_state == 1
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Provider circuit open"
+          description: "Circuit open for provider (circuit_state==1) for >1m."
+
+      - alert: ProviderProbeFailuresSpike
+        expr: increase(provider_probe_failures_total[5m]) > 10
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Provider probe failures spike"
+          description: "High rate of provider probe failures over 5m."
+
+      - alert: LockContentionHigh
+        expr: increase(provider_probe_failures_total[5m]) > 3
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Lock contention high"
+          description: "Possible lock contention or provider instability detected."
