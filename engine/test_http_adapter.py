@@ -122,6 +122,16 @@ class TestHermesHttpAdapter(unittest.TestCase):
             finally:
                 adapter.shutdown()
 
+    def test_adapter_accepts_task_escalation_actions(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            adapter = HermesHttpAdapter(data_dir=temp_dir, enabled=True)
+            try:
+                result = adapter.handle({"action": "run_task", "task": "inspect the repository", "workspace_path": temp_dir})
+                self.assertIn("status", result)
+                self.assertIn("summary", result)
+            finally:
+                adapter.shutdown()
+
 
 if __name__ == "__main__":
     unittest.main()

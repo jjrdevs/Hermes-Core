@@ -80,6 +80,12 @@ class HermesApi:
 
     def handle(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         action = str(payload.get("action", "")).strip().lower()
+        if action in {"run_task", "task"}:
+            return self.run_task(
+                payload["task"],
+                workspace_path=payload.get("workspace_path"),
+                context=payload.get("context"),
+            )
         if action == "run_workflow":
             return self.run_workflow(
                 payload["workflow_path"],

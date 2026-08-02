@@ -13,6 +13,8 @@ class HermesHttpAdapter:
 
     def handle(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         action = payload.get("action")
+        if action in {"run_task", "task"}:
+            return self.api.run_task(payload["task"], workspace_path=payload.get("workspace_path"), context=payload.get("context"))
         if action == "run_workflow":
             return self.api.run_workflow(payload["workflow_path"], provider=payload.get("provider", "stub"), model_name=payload.get("model_name"), endpoint=payload.get("endpoint"))
         if action in {"start_run", "start"}:
