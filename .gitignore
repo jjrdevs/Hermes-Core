@@ -26,6 +26,11 @@ executions/
 .cache/
 *.cache
 
+# Build artifacts (PyInstaller)
+build/
+dist/hermes
+dist/hermes-webui-launcher
+
 # OS files
 .DS_Store
 Thumbs.db
