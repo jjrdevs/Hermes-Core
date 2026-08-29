@@ -735,6 +735,182 @@ def command_job_resume(args: argparse.Namespace) -> int:
     return 0
 
 
+# ---------------------------------------------------------------------------
+# spec-schedule — drive scheduled jobs declared in spec-sheets
+# ---------------------------------------------------------------------------
+
+
+def _sheets_dir_for(args: argparse.Namespace) -> str:
+    """Resolve the spec-sheets directory from --data-dir (else default)."""
+    if getattr(args, "data_dir", None):
+        return str(Path(args.data_dir) / "spec-sheets")
+    from engine.spec_scheduler import default_sheets_dir
+
+    return default_sheets_dir()
+
+
+def _json(args: argparse.Namespace) -> bool:
+    return bool(getattr(args, "json", False))
+
+
+def command_spec_list(args: argparse.Namespace) -> int:
+    from engine.spec_scheduler import SpecScheduler
+
+    scheduler = SpecScheduler(sheets_dir=_sheets_dir_for(args))
+    sheets = scheduler.list_sheets()
+    if _json(args):
+        print(json.dumps({"sheets": sheets, "sheets_dir": str(scheduler.sheets_dir)}, indent=2))
+    else:
+        if not sheets:
+            print(f"(no spec-sheets in {scheduler.sheets_dir})")
+            return 0
+        for s in sheets:
+            print(s)
+    return 0
+
+
+def command_spec_show(args: argparse.Namespace) -> int:
+    from engine.spec_scheduler import SpecScheduler
+
+    scheduler = SpecScheduler(sheets_dir=_sheets_dir_for(args))
+    sheet = scheduler.load_sheet(args.name)
+    payload = {
+        "name": sheet.source,
+        "jobs": [
+            {
+                "name": spec.name,
+                "workflow": spec.workflow,
+                "schedule": spec.schedule,
+                "goal": spec.goal,
+                "provider": spec.provider,
+                "model": spec.model_name,
+                "endpoint": spec.endpoint,
+                "require_approval": spec.require_approval,
+                "budget": spec.budget,
+            }
+            for spec in sheet.jobs.values()
+        ],
+        "chains": [
+            {
+                "name": chain.name,
+                "jobs": chain.jobs,
+                "fail_strategy": chain.fail_strategy,
+            }
+            for chain in sheet.chains.values()
+        ],
+    }
+    print(json.dumps(payload, indent=2))
+    return 0
+
+
+def command_spec_add(args: argparse.Namespace) -> int:
+    from engine.spec_scheduler import SpecScheduler, SpecSheet
+
+    scheduler = SpecScheduler(sheets_dir=_sheets_dir_for(args))
+    name = args.name
+    if not name.endswith(".json"):
+        path = Path(scheduler.sheets_dir) / f"{name}.json"
+    else:
+        path = Path(scheduler.sheets_dir) / name
+
+    target = {
+        "name": args.job_name,
+        "workflow": args.workflow,
+        "schedule": args.schedule,
+        "goal": args.goal,
+        "provider": args.provider,
+        "model_name": args.model_name,
+        "endpoint": args.endpoint,
+        "require_approval": args.require_approval,
+        **({"context": json.loads(args.context)} if args.context else {}),
+    }
+
+    # Start from existing sheet (if any) as a plain data dict.
+    data = {"name": name, "jobs": [], "chains": []}
+    if path.exists():
+        try:
+            existing = SpecSheet.from_dict(source=str(path), data=json.loads(path.read_text()))
+        except Exception as exc:  # noqa: BLE001 - surface the real error to the user
+            print(f"Cannot read existing spec-sheet {path}: {exc}", file=sys.stderr)
+            return 1
+        for spec in existing.jobs.values():
+            data["jobs"].append({
+                "name": spec.name, "workflow": spec.workflow, "schedule": spec.schedule,
+                "goal": spec.goal, "provider": spec.provider, "model_name": spec.model_name,
+                "endpoint": spec.endpoint, "require_approval": spec.require_approval,
+                **({"budget": spec.budget} if spec.budget else {}),
+                **({"context": spec.context} if spec.context else {}),
+            })
+        for chain in existing.chains.values():
+            data["chains"].append({"name": chain.name, "jobs": chain.jobs,
+                                   "fail_strategy": chain.fail_strategy})
+
+    # Replace or append the targeted job by name.
+    data["jobs"] = [j for j in data["jobs"] if j["name"] != args.job_name]
+    data["jobs"].append(target)
+
+    SpecSheet.from_dict(source=str(path), data=data)  # validate before writing
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=2))
+    print(f"Added job {args.job_name!r} to spec-sheet {name!r} at {path}")
+    return 0
+
+
+def command_spec_run(args: argparse.Namespace) -> int:
+    from engine.spec_scheduler import STATUS_COMPLETED, SpecScheduler
+
+    scheduler = SpecScheduler(sheets_dir=_sheets_dir_for(args))
+    if args.chain:
+        sheet_name = args.sheet or "default"
+    else:
+        if not args.job:
+            print("spec-schedule run: specify --job or --chain", file=sys.stderr)
+            return 2
+        sheet_name = args.sheet or "default"
+    try:
+        if args.chain:
+            outcome = scheduler.run_chain(sheet_name, args.chain)
+            rows = outcome.to_dict()
+        else:
+            outcome = scheduler.run_job(sheet_name, args.job)
+            rows = _outcome_to_dict_cli(outcome)
+    except FileNotFoundError as exc:
+        print(f"spec-schedule run: {exc}", file=sys.stderr)
+        return 60  # usage: no such sheet
+    except KeyError as exc:
+        print(f"spec-schedule run: {exc}", file=sys.stderr)
+        return 60
+    if _json(args):
+        print(json.dumps(rows, indent=2))
+    else:
+        print(f"status={rows.get('status')} run_id={rows.get('run_id') or '-'}")
+        if rows.get("reason"):
+            print(f"reason={rows['reason']}")
+    if rows.get("status") and rows["status"] != STATUS_COMPLETED:
+        return 1
+    return 0
+
+
+def command_spec_status(args: argparse.Namespace) -> int:
+    from engine.spec_scheduler import SpecScheduler
+
+    scheduler = SpecScheduler(sheets_dir=_sheets_dir_for(args))
+    payload = scheduler.status()
+    payload["sheets_dir"] = str(scheduler.sheets_dir)
+    print(json.dumps(payload, indent=2))
+    return 0
+
+
+def _outcome_to_dict_cli(outcome) -> Dict[str, Any]:
+    return {
+        "job": outcome.job,
+        "status": outcome.status,
+        "run_id": outcome.run_id,
+        "reason": outcome.reason,
+        "duration_ms": outcome.duration_ms,
+    }
+
+
 def command_memory_list(args: argparse.Namespace) -> int:
     paths = resolve_data_paths(args.data_dir)
     memory_store = SQLiteMemoryStore(paths["event_db"].parent / "memory.db", max_entries=50)
@@ -986,6 +1162,29 @@ def main(argv: Optional[List[str]] = None) -> int:
     job_resume_parser = job_subparsers.add_parser("resume", parents=[parent_parser], help="Resume a persisted background job")
     job_resume_parser.add_argument("job_id", help="Job identifier")
 
+    spec_parser = subparsers.add_parser("spec-schedule", parents=[parent_parser], help="List, inspect, add to, and run spec-sheet schedules")
+    spec_subparsers = spec_parser.add_subparsers(dest="spec_command", required=True)
+    spec_subparsers.add_parser("list", parents=[parent_parser], help="List spec-sheets").add_argument("--json", action="store_true")
+    spec_show_p = spec_subparsers.add_parser("show", parents=[parent_parser], help="Show a spec-sheet's jobs and chains")
+    spec_show_p.add_argument("name", help="Spec-sheet name (with or without .json)")
+    spec_add_p = spec_subparsers.add_parser("add", parents=[parent_parser], help="Add (or replace) a job on a spec-sheet")
+    spec_add_p.add_argument("name", help="Spec-sheet name (with or without .json)")
+    spec_add_p.add_argument("job_name", help="Name of the job to add/replace")
+    spec_add_p.add_argument("--workflow", required=True, help="Workflow JSON path or id the job runs")
+    spec_add_p.add_argument("--schedule", default="manual", help="manual | now | interval:<s> | at:<iso> | cron:<5 fields>")
+    spec_add_p.add_argument("--goal", default=None)
+    spec_add_p.add_argument("--provider", default=None)
+    spec_add_p.add_argument("--model-name", default=None)
+    spec_add_p.add_argument("--endpoint", default=None)
+    spec_add_p.add_argument("--require-approval", action="store_true", default=False)
+    spec_add_p.add_argument("--context", default=None, help="JSON string of extra context for the job")
+    spec_run_p = spec_subparsers.add_parser("run", parents=[parent_parser], help="Run a single job or chain on demand")
+    spec_run_p.add_argument("--sheet", default=None, help="Spec-sheet name (default: 'default')")
+    spec_run_p.add_argument("--job", default=None, help="Job name to run")
+    spec_run_p.add_argument("--chain", default=None, help="Chain name to run")
+    spec_run_p.add_argument("--json", action="store_true")
+    spec_subparsers.add_parser("status", parents=[parent_parser], help="Show scheduler status and next-due map")
+
     memory_parser = subparsers.add_parser("memory", parents=[parent_parser], help="Inspect persisted memory entries")
     memory_subparsers = memory_parser.add_subparsers(dest="memory_command", required=True)
     memory_list_parser = memory_subparsers.add_parser("list", parents=[parent_parser], help="List persisted memories")
@@ -1063,6 +1262,17 @@ def main(argv: Optional[List[str]] = None) -> int:
                 return command_job_get(args)
             if args.job_command == "resume":
                 return command_job_resume(args)
+        if args.command == "spec-schedule":
+            if args.spec_command == "list":
+                return command_spec_list(args)
+            if args.spec_command == "show":
+                return command_spec_show(args)
+            if args.spec_command == "add":
+                return command_spec_add(args)
+            if args.spec_command == "run":
+                return command_spec_run(args)
+            if args.spec_command == "status":
+                return command_spec_status(args)
         if args.command == "memory":
             if args.memory_command == "list":
                 return command_memory_list(args)
