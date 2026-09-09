@@ -108,6 +108,25 @@ class TestHermesHttpAdapter(unittest.TestCase):
             finally:
                 adapter.shutdown()
 
+    def test_adapter_exposes_run_progress_and_failure_context(self):
+        workflow_path = Path(__file__).resolve().parent.parent / "examples" / "approval_example.json"
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            adapter = HermesHttpAdapter(data_dir=temp_dir, enabled=True)
+            try:
+                started = adapter.handle({"action": "start_run", "workflow_path": str(workflow_path), "context": {"execution_mode": "manual"}})
+                progress = adapter.handle({"action": "get_run_progress", "run_id": started["run_id"]})
+
+                self.assertEqual(progress["run_id"], started["run_id"])
+                self.assertIn(progress["status"], {"WAITING_APPROVAL", "RUNNING", "PLANNING", "QUEUED"})
+                self.assertIn("progress", progress)
+                self.assertIn("recent_events", progress)
+                self.assertIn("checkpoint", progress)
+                self.assertIn("resume_hint", progress)
+                self.assertIn("failure_context", progress)
+            finally:
+                adapter.shutdown()
+
     def test_adapter_exposes_checkpoint_inspection_actions(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             adapter = HermesHttpAdapter(data_dir=temp_dir, enabled=True)

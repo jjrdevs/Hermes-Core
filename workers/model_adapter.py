@@ -3,8 +3,41 @@ from __future__ import annotations
 import json
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Union
 from urllib import error, request
+
+DEFAULT_ENDPOINT = "http://localhost:11434"
+
+
+# Executor contract for generate_with_tools:
+#   (tool_id: str, action: str, params: Dict[str, Any]) -> str | Dict[str, Any]
+# Returned value is JSON-encoded into the tool message fed back to the model.
+ToolExecutor = Callable[[str, str, Dict[str, Any]], Union[str, Dict[str, Any]]]
+
+
+@dataclass(frozen=True)
+class ChatResult:
+    """Return value of ModelAdapter.generate_with_tools.
+
+    text:
+        The final assistant text after the loop converged on finish_reason
+        without further tool_calls (may be empty string if the model only
+        ever emitted tool_calls and then stopped).
+    tool_calls:
+        One entry per tool dispatch in execution order:
+        ``[tool_id, action, params, executor_output_json]``.
+    iterations:
+        Number of POST /v1/chat/completions round-trips (>= 1).
+    finish_reason:
+        The finish_reason value of the final assistant turn.
+        If the loop hits max_iterations before the model stops emitting
+        tool_calls, this is "max_iterations_reached".
+    """
+
+    text: str
+    tool_calls: List[List[Any]]
+    iterations: int
+    finish_reason: str
 
 
 @dataclass(frozen=True)
@@ -53,6 +86,40 @@ class ModelAdapter(ABC):
     def capabilities(self) -> Dict[str, Any]:
         raise NotImplementedError
 
+    def generate_with_tools(
+        self,
+        messages: List[Dict[str, Any]],
+        tools: Optional[List[Dict[str, Any]]],
+        *,
+        tool_executor: Optional[ToolExecutor] = None,
+        max_iterations: int = 8,
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+    ) -> ChatResult:
+        """Run a multi-turn tool-calling loop against the provider.
+
+        `messages` is the initial message history:
+            [{"role": "system", "content": "..."}, {"role": "user", "content": "..."}, ...]
+
+        `tools` is a list of OpenAI-style tool schemas:
+            [{"type": "function",
+              "function": {"name": "<tool_id>",
+                          "description": "...",
+                          "parameters": {"type": "object", "properties": {...}, "required": [...]}}},
+             ...]
+        Tool `name` MUST equal `ToolRequest.tool_id`. Parameters are the
+        parameter dict (typically `{"action": <str>}` plus any action
+        parameters).
+
+        `tool_executor(tool_id, action, parameters) -> str | dict` is what
+        actually runs each tool call (in production this should be bound
+        to the kernel's `request_tool` + approval gate + `execute_tool_request`
+        path).
+
+        `max_iterations` bounds the number of /chat/completions round-trips.
+        """
+        raise NotImplementedError
+
 
 class StubModelAdapter(ModelAdapter):
     def __init__(self, config: Optional[ModelAdapterConfig] = None) -> None:
@@ -78,6 +145,35 @@ class StubModelAdapter(ModelAdapter):
     def capabilities(self) -> Dict[str, Any]:
         return self._capabilities
 
+    def generate_with_tools(
+        self,
+        messages: List[Dict[str, Any]],
+        tools: Optional[List[Dict[str, Any]]],
+        *,
+        tool_executor: Optional[ToolExecutor] = None,
+        max_iterations: int = 8,
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+    ) -> ChatResult:
+        # Offline-safe: the stub never emits tool calls. If an executor is
+        # provided and the caller wants a deterministic one-call round trip,
+        # we can honor exactly one call for the first declared tool.
+        last_user = next((m for m in reversed(messages) if m.get("role") == "user"), None)
+        last_text = (last_user or {}).get("content", "")
+        if tools and tool_executor is not None and messages and len(messages) == 1:
+            first = tools[0]
+            func = (first or {}).get("function") or {}
+            name = func.get("name") or "stub_tool"
+            out = tool_executor(name, "invoke", {})
+            out_json = out if isinstance(out, str) else json.dumps(out or {})
+            return ChatResult(
+                text=f"[stub response] {last_text} (dispatched {name})",
+                tool_calls=[[name, "invoke", {}, out_json]],
+                iterations=1,
+                finish_reason="tool_calls",
+            )
+        return ChatResult(text=f"[stub response] {last_text}", tool_calls=[], iterations=1, finish_reason="stop")
+
 
 class OllamaModelAdapter(ModelAdapter):
     def __init__(self, config: Optional[ModelAdapterConfig] = None) -> None:
@@ -89,7 +185,7 @@ class OllamaModelAdapter(ModelAdapter):
                 "code": True,
                 "reasoning": True,
                 "planning": True,
-                "tool_use": False,
+                "tool_use": True,
                 "vision": False,
                 "structured_output": True,
             },
@@ -126,6 +222,117 @@ class OllamaModelAdapter(ModelAdapter):
             raise RuntimeError("Ollama returned invalid JSON") from exc
 
         return parsed.get("response", "")
+
+    def _chat_completion(
+        self,
+        messages: List[Dict[str, Any]],
+        tools: Optional[List[Dict[str, Any]]],
+        *,
+        temperature: float,
+        max_tokens: int,
+    ) -> Dict[str, Any]:
+        """One round-trip against /v1/chat/completions. Returns the parsed JSON body.
+
+        Raises RuntimeError on network failure or invalid JSON. Does NOT send
+        `tool_choice` (Ollama's Go backend errors on unknown top-level keys).
+        """
+        endpoint = (self.config.endpoint or DEFAULT_ENDPOINT).rstrip("/")
+        if endpoint.endswith("/v1"):
+            url = f"{endpoint}/chat/completions"
+        elif "/api/" in endpoint:
+            url = endpoint.rsplit("/api", 1)[0].rstrip("/") + "/v1/chat/completions"
+        else:
+            url = f"{endpoint}/v1/chat/completions"
+
+        payload: Dict[str, Any] = {
+            "model": self.config.model_name or self._capabilities["name"],
+            "messages": messages,
+            "stream": False,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+        }
+        if tools:
+            payload["tools"] = tools
+        headers = {"Content-Type": "application/json"}
+        if self.config.api_key:
+            headers["Authorization"] = f"Bearer {self.config.api_key}"
+        data = json.dumps(payload).encode("utf-8")
+        req = request.Request(url, data=data, headers=headers, method="POST")
+        try:
+            with request.urlopen(req, timeout=self.config.timeout_seconds) as response:
+                body = response.read().decode("utf-8")
+        except error.URLError as exc:
+            raise RuntimeError(f"Ollama request failed: {exc}") from exc
+        try:
+            return json.loads(body)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("Ollama returned invalid JSON") from exc
+
+    def generate_with_tools(
+        self,
+        messages: List[Dict[str, Any]],
+        tools: Optional[List[Dict[str, Any]]],
+        *,
+        tool_executor: Optional[ToolExecutor] = None,
+        max_iterations: int = 8,
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+    ) -> ChatResult:
+        if not messages:
+            raise ValueError("messages must be non-empty")
+        temp = self.config.temperature if temperature is None else temperature
+        tok = self.config.max_tokens if max_tokens is None else max_tokens
+
+        history = [dict(m) for m in messages]
+        dispatched: List[List[Any]] = []
+        iterations = 0
+        final_text = ""
+        final_reason = "stop"
+
+        for _ in range(max(1, max_iterations)):
+            iterations += 1
+            body = self._chat_completion(history, tools, temperature=temp, max_tokens=tok)
+            try:
+                choice = body["choices"][0]
+            except (KeyError, IndexError, TypeError) as exc:
+                raise RuntimeError(f"Ollama returned unexpected shape: {str(body)[:200]}") from exc
+            message = choice.get("message") or {}
+            content = message.get("content")
+            final_text = content if isinstance(content, str) else ("" if content is None else str(content))
+            tool_calls = message.get("tool_calls") or []
+            final_reason = choice.get("finish_reason") or ("tool_calls" if tool_calls else "stop")
+
+            if not tool_calls:
+                break  # model produced a final answer
+
+            # Record the assistant's tool_call turn, then dispatch each call.
+            history.append({"role": "assistant", "content": final_text, "tool_calls": tool_calls})
+            for call in tool_calls:
+                func = call.get("function") or {}
+                tool_id = func.get("name") or ""
+                raw_args = func.get("arguments") or "{}"
+                if not isinstance(raw_args, str):
+                    raw_args = json.dumps(raw_args)
+                try:
+                    params = json.loads(raw_args) if raw_args.strip() else {}
+                    if not isinstance(params, dict):
+                        params = {"value": params}
+                except (ValueError, TypeError):
+                    params = {}
+                action = str(params.pop("action", "invoke") or "invoke")
+                if tool_executor is None:
+                    executor_out: Any = f"tool_executor not provided for {tool_id!r}"
+                else:
+                    executor_out = tool_executor(tool_id, action, params)
+                executor_json = executor_out if isinstance(executor_out, str) else json.dumps(executor_out or {})
+                dispatched.append([tool_id, action, params, executor_json])
+                call_id = call.get("id") or f"call_{iterations}_{len(tool_calls)}"
+                history.append({"role": "tool", "tool_call_id": call_id, "content": executor_json})
+        else:
+            # for...else: loop ran to max_iterations without the model stopping.
+            final_reason = "max_iterations_reached"
+
+        return ChatResult(text=final_text, tool_calls=dispatched, iterations=iterations, finish_reason=final_reason)
 
     def capabilities(self) -> Dict[str, Any]:
         return self._capabilities
@@ -281,9 +488,26 @@ class ModelAdapterRouter:
 
 
 class ModelAdapterFactory:
-    @staticmethod
-    def create(config: Optional[ModelAdapterConfig] = None) -> ModelAdapter:
+    """Provider -> concrete adapter registry.
+
+    Providers that speak the OpenAI-compatible /v1/chat/completions HTTP API
+    (including Ollama's, OpenAI, OpenRouter, and any custom local or hosted
+    backend) are backed by the same concrete adapter, which implements
+    generate_with_tools on top of that API. We keep the legacy name
+    "OllamaModelAdapter" for it to stay a minimal-diff refactor; if we add
+    a provider with a different wire protocol we'd add a new class.
+
+    Only `stub` (in-process canned responses, no network) and `openai`,
+    `openrouter`, `anthropic` (not yet mapped: falls through to stub with
+    a clear comment — wire up once we have a real key + endpoint for it)
+    get their own routing.
+    """
+
+    _OPENAI_COMPAT_PROVIDERS = frozenset({"ollama", "openai", "openrouter", "custom", "local"})
+
+    @classmethod
+    def create(cls, config: Optional[ModelAdapterConfig] = None) -> ModelAdapter:
         config = config or ModelAdapterConfig()
-        if config.provider == "ollama":
+        if config.provider in cls._OPENAI_COMPAT_PROVIDERS:
             return OllamaModelAdapter(config)
         return StubModelAdapter(config)

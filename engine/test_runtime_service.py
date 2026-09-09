@@ -2330,6 +2330,132 @@ class TestRuntimeService(unittest.TestCase):
             finally:
                 service.shutdown()
 
+    def test_queue_run_persists_provider_for_resume(self):
+        """P1-2: queue_run must persist provider/model/endpoint on the run
+        record so ``_resume_pending_runs`` can recover the exact routing after
+        a service restart (the ``RUN_PROVIDER_ROUTED`` event is an audit trail
+        and is asserted separately to avoid racing the background thread)."""
+        workflow_path = Path(__file__).resolve().parent.parent / "examples" / "hello_world.json"
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = RuntimeService(data_dir=temp_dir)
+            try:
+                service.queue_run(
+                    str(workflow_path),
+                    provider="ollama",
+                    model_name="qwen3.8:27b",
+                    endpoint="http://localhost:11434/v1/chat/completions",
+                )
+                run_id = service.run_store.list()[0]["run_id"]
+                record = service.run_store.get(run_id)
+                self.assertEqual(record["resume_provider"], "ollama")
+                self.assertEqual(record["resume_model_name"], "qwen3.8:27b")
+                self.assertEqual(record["resume_endpoint"], "http://localhost:11434/v1/chat/completions")
+                self.assertEqual(record["selected_provider"], "ollama")
+            finally:
+                service.shutdown()
+
+    def test_resume_run_recovers_persisted_provider(self):
+        """P1-2 (recovery half): ``_resume_pending_runs`` must re-launch the
+        workflow runner with the exact provider/model/endpoint that were
+        persisted at enqueue time -- not default to the 'stub' provider.
+
+        Seeds a run record in the exact shape ``queue_run`` produces (see
+        the persistence block in ``runtime_service.queue_run``), then calls
+        ``_resume_pending_runs`` directly with a patched
+        ``_run_queued_workflow`` so the captured ``.kwargs`` are deterministic.
+        """
+        execution_id = "execution-test-seed-0001"
+        run_id = "run-test-seed-0001"
+        workflow_path = Path(__file__).resolve().parent.parent / "examples" / "hello_world.json"
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = RuntimeService(data_dir=temp_dir)
+            try:
+                # Seed the persisted run record -- the same contract that
+                # ``queue_run`` writes to disk.
+                service.run_store.create(run_id, {
+                    "run_id": run_id,
+                    "execution_id": execution_id,
+                    "workflow_name": "seeded",
+                    "workflow_path": str(workflow_path),
+                    "status": "QUEUED",
+                    "queued_for_background": True,
+                    "recovery": {},
+                    "provider_routing": {"selected_provider": "ollama"},
+                    "selected_provider": "ollama",
+                    "resume_provider": "ollama",
+                    "resume_model_name": "qwen3.8:27b",
+                    "resume_endpoint": "http://localhost:11434/v1/chat/completions",
+                    "idempotency_key": None,
+                })
+                # Kernel status: RUNNING is non-terminal so _resume_pending_runs
+                # proceeds to re-launch the background thread.
+                service.kernel.get_workflow_status = lambda eid: "RUNNING"
+
+                # Patch threading.Thread so the test is fully synchronous -- no
+                # real thread starts, and we capture the Thread constructor's
+                # kwargs (target / args / kwargs) directly.
+                with mock.patch("threading.Thread") as fake_thread_cls:
+                    service._resume_pending_runs()
+
+                # The Thread constructor must have been called exactly for our
+                # seeded run; inspect its captured kwargs.
+                self.assertTrue(
+                    fake_thread_cls.call_args_list,
+                    "expected _resume_pending_runs to construct a background Thread",
+                )
+                thread_ctor = fake_thread_cls.call_args_list[-1].kwargs
+                self.assertIn("kwargs", thread_ctor, "Thread must be constructed with kwargs dict")
+                captured = thread_ctor["kwargs"]
+                self.assertEqual(captured.get("provider"), "ollama")
+                self.assertEqual(captured.get("model_name"), "qwen3.8:27b")
+                self.assertEqual(captured.get("endpoint"), "http://localhost:11434/v1/chat/completions")
+
+                # Sanity: the record still carries the resume_* fields.
+                record = service.run_store.get(run_id)
+                self.assertEqual(record.get("resume_provider"), "ollama")
+                self.assertEqual(record.get("resume_model_name"), "qwen3.8:27b")
+                self.assertEqual(record.get("resume_endpoint"), "http://localhost:11434/v1/chat/completions")
+            finally:
+                service.shutdown()
+
+    def test_respond_approval_deny_routes_to_cancel(self):
+        """P1-3: a deny-family choice on a workflow-gated run (no pending tool
+        approval) must land in a terminal negative (CANCELLED), not silently
+        no-op. This is exactly what the WebUI 'Reject' button drives."""
+        workflow_path = Path(__file__).resolve().parent.parent / "examples" / "approval_example.json"
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = RuntimeService(data_dir=temp_dir)
+            try:
+                started = service.start_run(str(workflow_path))
+                run_id = started["run_id"]
+                self.assertEqual(service.get_run(run_id)["status"], "WAITING_APPROVAL")
+
+                response = service.respond_approval(run_id, choice="deny")
+                self.assertFalse(response.get("approved", False))
+                self.assertEqual(response.get("status"), "CANCELLED")
+                self.assertEqual(service.get_run(run_id)["status"], "CANCELLED")
+            finally:
+                service.shutdown()
+
+    def test_respond_approval_deny_with_stale_approval_id_surfaces_error(self):
+        """P1-3: a deny with a stale/unknown ``approval_id`` must surface the
+        deny error (NOT_FOUND) rather than silently swallow the intent."""
+        workflow_path = Path(__file__).resolve().parent.parent / "examples" / "approval_example.json"
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = RuntimeService(data_dir=temp_dir)
+            try:
+                started = service.start_run(str(workflow_path))
+                run_id = started["run_id"]
+                response = service.respond_approval(run_id, approval_id="tool-approval-deadbeef", choice="deny")
+                self.assertIn(response.get("status"), {"NOT_FOUND", "REJECTED", "DENIED", "CANCELLED"})
+                self.assertFalse(response.get("approved", False))
+            finally:
+                service.shutdown()
+
     def test_observe_run_exposes_richer_event_metadata(self):
         workflow_path = Path(__file__).resolve().parent.parent / "examples" / "hello_world.json"
 

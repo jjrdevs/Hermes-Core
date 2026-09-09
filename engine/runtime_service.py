@@ -12,7 +12,7 @@ import threading
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 from engine.models import Artifact, ExecutionContext, TaskEnvelope, WorkflowDefinition, ToolContract, ToolExecutionEnvelope, ToolRequest, WorkerRequest, _now_iso
 from engine.runtime import RuntimeKernel
@@ -20,7 +20,24 @@ from engine.storage import SQLiteMemoryStore, SQLiteRunStore
 from engine.tool_runtime import FilesystemTool
 from engine.workflow_loader import build_tool_definitions, build_workflow_definition, load_json_file, resolve_data_paths, resolve_input_path
 from workers.local_worker import LocalWorker
-from workers.model_adapter import ModelAdapterConfig, ModelAdapterFactory, ModelAdapterRouter, ProviderProfile
+from workers.model_adapter import ModelAdapterConfig, ModelAdapterFactory, ModelAdapterRouter, OllamaModelAdapter, ProviderProfile
+
+# Normalizer for c3: the webui/`custom` provider is an OpenAI-compatible
+# endpoint (Ollama, OpenRouter, any OpenAI-clone). The in-core "ollama"
+# profile is the concrete adapter we actually use for all of those, so we
+# alias the external label to the internal one before calling the router.
+# This keeps a single source of truth (OllamaModelAdapter) while letting the
+# webui/bridge keep saying "custom" as the public provider name.
+# NOTE: the factory (ModelAdapterFactory.create) already lists these under
+# _OPENAI_COMPAT_PROVIDERS; the router (below) is what normalizes the public
+# label to the internal `ollama` key so `route()` picks the right profile.
+_OPENAI_COMPAT_PROVIDER_ALIASES = {
+    "custom": "ollama",
+    "openai": "ollama",
+    "openrouter": "ollama",
+    "local": "ollama",
+    "ollama": "ollama",
+}
 
 
 class RuntimeService:
@@ -57,17 +74,50 @@ class RuntimeService:
         self.kernel.register_workflow_definition(workflow_definition)
         return workflow_definition
 
-    def _build_model_router(self, provider: str = "stub", model_name: Optional[str] = None, endpoint: Optional[str] = None) -> ModelAdapterRouter:
+    def _build_model_router(self, provider: str = "stub", model_name: Optional[str] = None, endpoint: Optional[str] = None, timeout_seconds: Optional[float] = None) -> ModelAdapterRouter:
+        # c3: normalize public provider label to the internal profile.
+        # `custom`, `openai`, `openrouter`, `local` are all OpenAI-compatible
+        # endpoints, and the in-core "ollama" profile is the concrete adapter
+        # we use for all of them (`ModelAdapterFactory._OPENAI_COMPAT_PROVIDERS`
+        # already lists all five). Without this alias pass, the router only
+        # has "stub" and "ollama" profiles, so a call with provider="custom"
+        # fails the preferred match (ModelAdapterRouter._select_provider)
+        # and falls through to cost-rank sort → "stub" wins (rank 0 <
+        # "local" rank 1). Normalizing to "ollama" first makes the preferred
+        # match hit the ollama profile directly and we get a real
+        # OllamaModelAdapter with the correct model_name/endpoint.
+        provider = _OPENAI_COMPAT_PROVIDER_ALIASES.get(provider, provider)
+        # Wire model_name/endpoint through to the provider profile so the
+        # concrete adapter (OllamaModelAdapter etc.) picks up the caller's
+        # configuration instead of falling back to "llama3.1" / the default
+        # endpoint, which is what caused the 404s against local Ollama.
+        #
+        # Timeout: local CPU/MoE servers (e.g. ik_llama.cpp flash-next on
+        # :8090) can need 30-60s+ time-to-first-token per step, so the old
+        # flat 30s urlopen timeout killed valid generations. Honour a
+        # per-run override (threaded from runtime_hints.timeout_seconds by
+        # start_run) and raise the default to 600s; clamp to [1, 3600].
+        if timeout_seconds is None:
+            timeout_seconds = 600.0
+        try:
+            timeout_seconds = max(1.0, min(3600.0, float(timeout_seconds)))
+        except (TypeError, ValueError):
+            timeout_seconds = 600.0
+        ollama_kwargs = {}
+        if model_name:
+            ollama_kwargs["model_name"] = model_name
+        if endpoint:
+            ollama_kwargs["endpoint"] = endpoint
         return ModelAdapterRouter(
             profiles=[
                 ProviderProfile(provider="stub", cost_class="cheap", available=True, healthy=True, timeout_seconds=2.0, options={"cost_per_token": 0.0}),
-                ProviderProfile(provider="ollama", cost_class="local", available=True, healthy=True, timeout_seconds=30.0, options={"cost_per_token": 0.000002}),
+                ProviderProfile(provider="ollama", cost_class="local", available=True, healthy=True, timeout_seconds=timeout_seconds, options={"cost_per_token": 0.000002}, **ollama_kwargs),
             ],
             preferred_provider=provider,
         )
 
-    def _route_provider(self, prompt: str, provider: str = "stub", model_name: Optional[str] = None, endpoint: Optional[str] = None):
-        router = self._build_model_router(provider=provider, model_name=model_name, endpoint=endpoint)
+    def _route_provider(self, prompt: str, provider: str = "stub", model_name: Optional[str] = None, endpoint: Optional[str] = None, timeout_seconds: Optional[float] = None):
+        router = self._build_model_router(provider=provider, model_name=model_name, endpoint=endpoint, timeout_seconds=timeout_seconds)
         decision = router.route(prompt, task_complexity="simple")
         if provider not in {profile.provider for profile in router.profiles}:
             decision.health_summary.setdefault("provider_health", {})[provider] = {
@@ -83,9 +133,104 @@ class RuntimeService:
             }
         return decision
 
-    def _build_model_adapter(self, provider: str = "stub", model_name: Optional[str] = None, endpoint: Optional[str] = None):
-        decision = self._route_provider("default runtime task", provider=provider, model_name=model_name, endpoint=endpoint)
+    def _build_model_adapter(self, provider: str = "stub", model_name: Optional[str] = None, endpoint: Optional[str] = None, timeout_seconds: Optional[float] = None):
+        decision = self._route_provider("default runtime task", provider=provider, model_name=model_name, endpoint=endpoint, timeout_seconds=timeout_seconds)
         return decision.adapter
+
+    def _find_run_id_for_execution(self, execution_id: Optional[str]) -> Optional[str]:
+        if not execution_id:
+            return None
+        for run_record in self.run_store.list():
+            if run_record.get("execution_id") == execution_id:
+                return run_record.get("run_id")
+        return None
+
+    def _build_step_worker(self, step_execution_id: str, model_adapter: Any) -> LocalWorker:
+        """Build a LocalWorker with a native tool schema + executor closure so the LLM
+        can drive real filesystem read/write. The executor goes through
+        self.execute_tool_request — which enforces the service-level policy,
+        budget, and approval gates — and feeds the resulting envelope back to
+        the model as a role:"tool" message.
+
+        Falls back to a plain (legacy single-shot) LocalWorker if the
+        filesystem tool is not registered on the kernel, or if the model
+        adapter does not advertise generate_with_tools support.
+        """
+        # Best-effort resolution of run_id so execute_tool_request has the
+        # full policy/budget/event context (write_safe short-circuits either
+        # way; threading run_id also populates the run's tool_execution_ledger).
+        run_id: Optional[str] = None
+        execution_id_for_run: Optional[str] = None
+        try:
+            step_execution = self.kernel.step_executions.get(step_execution_id)
+            workflow_execution = (
+                self.kernel.workflow_executions.get(step_execution.workflow_id)
+                if step_execution is not None
+                else None
+            )
+            execution_id_for_run = (
+                workflow_execution.execution_id if workflow_execution is not None else None
+            )
+            run_id = self._find_run_id_for_execution(execution_id_for_run)
+        except Exception:
+            run_id = None
+            execution_id_for_run = None
+
+        fs_tool = self.kernel.tool_registry.get("filesystem") if self.kernel.tool_registry else None
+        if fs_tool is None or not hasattr(model_adapter, "generate_with_tools"):
+            # No filesystem registered or adapter doesn't support tools —
+            # let LocalWorker take the legacy single-shot path.
+            return LocalWorker(model_adapter)
+
+        fs_actions = [
+            "read_file", "write_file", "list_directory", "create_file",
+            "create_directory", "delete_file", "move_file", "copy_file",
+        ]
+        tools: List[Dict[str, Any]] = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "filesystem",
+                    "description": (
+                        "Read and write files in the workspace. "
+                        "Actions: read_file, write_file, list_directory, "
+                        "create_file, create_directory, delete_file, "
+                        "move_file, copy_file."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "action": {
+                                "type": "string",
+                                "description": "The filesystem operation to perform.",
+                                "enum": fs_actions,
+                            },
+                            "path": {"type": "string", "description": "Absolute or workspace-relative file/directory path."},
+                            "destination": {"type": "string", "description": "For move_file/copy_file: destination path."},
+                            "content": {"type": "string", "description": "For write_file/create_file: content to write."},
+                        },
+                        "required": ["action"],
+                    },
+                },
+            }
+        ]
+
+        def tool_executor(tool_id: str, action: str, parameters: Dict[str, Any]) -> Union[str, Dict[str, Any]]:
+            request = ToolRequest(tool_id=tool_id, action=action, parameters=parameters or {})
+            envelopes = self.execute_tool_request(
+                request, run_id=run_id, step_execution_id=step_execution_id
+            )
+            if not envelopes:
+                return {"error": "no execution envelope returned"}
+            envelope = envelopes[0]
+            output = envelope.output
+            if isinstance(output, (dict, str)):
+                # ToolExecutor protocol expects str | dict; pass through.
+                return output
+            # Unexpected type: wrap for the role:"tool" message.
+            return {"output": output, "error": envelope.error, "status": envelope.status}
+
+        return LocalWorker(model_adapter, tools=tools, tool_executor=tool_executor)
 
     def _execute_step(self, execution_id: str, step_execution_id: str, model_adapter: Any) -> None:
         execution = self.kernel.step_executions[step_execution_id]
@@ -109,22 +254,55 @@ class RuntimeService:
         if not decision.allowed:
             raise RuntimeError(f"Start denied: {decision.reason}")
 
-        worker = LocalWorker(model_adapter)
+        worker = self._build_step_worker(step_execution_id, model_adapter)
+        # Inject the user's task brief into the worker prompt. Without this,
+        # the model only sees the generic step objective ("Implement the
+        # approved plan…") with no concrete task, and wanders into phantom
+        # paths. LocalWorker inserts context["system"] as a system message.
+        worker_context: Dict[str, Any] = {
+            "artifact_refs": execution.input_artifacts,
+            "expected_outputs": step_definition.outputs,
+        }
+        sys_parts: List[str] = []
+        run_id_for_context = self._find_run_id_for_execution(execution_id)
+        if run_id_for_context is not None:
+            try:
+                run_rec_for_ctx = self.run_store.get(run_id_for_context) or {}
+            except Exception:
+                run_rec_for_ctx = {}
+            run_ctx = run_rec_for_ctx.get("context") or {}
+            goal_text = run_ctx.get("agent_goal") or run_ctx.get("last_user_message")
+            if isinstance(goal_text, str) and goal_text.strip():
+                sys_parts.append("USER TASK BRIEF — the concrete task for this workflow run:\n" + goal_text.strip())
+            cap = run_ctx.get("capability_contract") or {}
+            writable = [str(p) for p in (cap.get("writable_paths") or []) if str(p).strip()]
+            if writable:
+                sys_parts.append("Filesystem sandbox — read and write ONLY under these directories:\n" + "\n".join(writable))
+        if sys_parts:
+            worker_context["system"] = "\n\n".join(sys_parts)
         request = WorkerRequest(
             execution_id=step_execution_id,
             workflow_id=execution.workflow_id,
             role=step_definition.role,
             objective=step_definition.objective,
-            context={
-                "artifact_refs": execution.input_artifacts,
-                "expected_outputs": step_definition.outputs,
-            },
+            context=worker_context,
             constraints=step_definition.constraints,
         )
         response = worker.execute(request)
-        for recommendation in response.recommendations:
-            if recommendation is not None:
-                self.kernel.request_tool(step_execution_id, recommendation.tool_id, recommendation.action, recommendation.parameters)
+        # Double-execution guard. When `tools+tool_executor` was passed to
+        # LocalWorker, the adapter already ran every tool call through
+        # tool_executor during the generate_with_tools loop (local_worker.py).
+        # tool_executor here is a closure that delegates to
+        # self.execute_tool_request(...), which already records each call
+        # in the run's event log + tool_execution_ledger (when run_id is
+        # threaded through). Those calls also surface in
+        # `response.recommendations` for observability, but re-dispatching
+        # them via kernel.request_tool would run the FilesystemTool twice.
+        # So: only re-dispatch in the legacy single-shot path.
+        if not getattr(worker, "native_tools_used", False):
+            for recommendation in response.recommendations:
+                if recommendation is not None:
+                    self.kernel.request_tool(step_execution_id, recommendation.tool_id, recommendation.action, recommendation.parameters)
         self.kernel.complete_execution(step_execution_id, response.artifacts_created)
 
     def _advance_workflow(
@@ -135,8 +313,9 @@ class RuntimeService:
         model_name: Optional[str] = None,
         endpoint: Optional[str] = None,
         stop_on_pause: bool = False,
+        timeout_seconds: Optional[float] = None,
     ) -> None:
-        model_adapter = self._build_model_adapter(provider=provider, model_name=model_name, endpoint=endpoint)
+        model_adapter = self._build_model_adapter(provider=provider, model_name=model_name, endpoint=endpoint, timeout_seconds=timeout_seconds)
 
         while not self.kernel.workflow_complete(execution_id):
             step_execution_id = self.kernel.schedule_next_step(execution_id)
@@ -2731,8 +2910,6 @@ class RuntimeService:
             )
             # Determine provider routing for this run so it can be persisted
             routing_decision = self._route_provider("start_run routing", provider=provider, model_name=model_name, endpoint=endpoint)
-            # Provider routing decision and health summary for observability
-            routing_decision = self._route_provider("start_run routing", provider=provider, model_name=model_name, endpoint=endpoint)
             self._advance_workflow(execution_id, provider=provider, model_name=model_name, endpoint=endpoint)
             return self.get_execution_summary(execution_id)
 
@@ -2764,6 +2941,12 @@ class RuntimeService:
             run_record = self._build_run_payload(run_id, execution_id, workflow_definition.name, workflow_path, "STARTING", context=context)
             run_record["provider_routing"] = routing_decision.health_summary if routing_decision is not None else {}
             run_record["selected_provider"] = routing_decision.provider if routing_decision is not None else provider
+            # Persist the caller's provider selection so approval-continuation
+            # and crash-recovery resume with the SAME adapter instead of
+            # silently falling back to the stub adapter.
+            run_record["resume_provider"] = provider
+            run_record["resume_model_name"] = model_name
+            run_record["resume_endpoint"] = endpoint
             run_record["idempotency_key"] = context.get("idempotency_key") if context else None
             if context and context.get("auto_approve"):
                 run_record["auto_approve"] = True
@@ -2814,6 +2997,15 @@ class RuntimeService:
             )
             run_id = str(uuid.uuid4())
             run_record = self._build_run_payload(run_id, execution_id, workflow_definition.name, workflow_path, "QUEUED", context=context)
+            # Determine provider routing for this run so it can be persisted and
+            # recovered verbatim by ``_resume_pending_runs`` after a restart (see
+            # the start_run persistence above).
+            routing_decision = self._route_provider("queue_run routing", provider=provider, model_name=model_name, endpoint=endpoint)
+            run_record["provider_routing"] = routing_decision.health_summary if routing_decision is not None else {}
+            run_record["selected_provider"] = routing_decision.provider if routing_decision is not None else provider
+            run_record["resume_provider"] = provider
+            run_record["resume_model_name"] = model_name
+            run_record["resume_endpoint"] = endpoint
             run_record["idempotency_key"] = context.get("idempotency_key") if context else None
             if context and context.get("auto_approve"):
                 run_record["auto_approve"] = True
@@ -2823,6 +3015,7 @@ class RuntimeService:
                         run_record["context"][key] = context[key]
             run_record["queued_for_background"] = True
             self.run_store.create(run_id, run_record)
+            self._record_run_event(run_id, "RUN_PROVIDER_ROUTED", {"provider_routing": run_record.get("provider_routing"), "selected_provider": run_record.get("selected_provider")}, source="bridge")
             self._record_run_event(run_id, "RUN_QUEUED", {"workflow_path": workflow_path, "workflow_name": workflow_definition.name, "execution_id": execution_id}, source="bridge")
             self._update_liveness_and_recovery(run_id, run_record)
             thread = threading.Thread(
@@ -2904,6 +3097,11 @@ class RuntimeService:
             thread = threading.Thread(
                 target=self._run_queued_workflow,
                 args=(run_id, execution_id),
+                kwargs={
+                    "provider": run_record.get("resume_provider") or "stub",
+                    "model_name": run_record.get("resume_model_name"),
+                    "endpoint": run_record.get("resume_endpoint"),
+                },
                 daemon=True,
             )
             self._background_threads[run_id] = thread
@@ -2921,7 +3119,12 @@ class RuntimeService:
         try:
             self.kernel.approve_workflow(execution_id, approved_by="auto-approval", reason="auto-approved for unattended execution")
             self._record_run_event(run_id, "CONTROL_RESPONDED", {"choice": "approve", "mode": "auto"}, status="RUNNING", source="bridge")
-            self._advance_workflow(execution_id)
+            self._advance_workflow(
+                execution_id,
+                provider=run_record.get("resume_provider") or "stub",
+                model_name=run_record.get("resume_model_name"),
+                endpoint=run_record.get("resume_endpoint"),
+            )
         except Exception:
             pass
 
@@ -2986,6 +3189,30 @@ class RuntimeService:
             "recovery_restart_count": recovery.get("restart_count", 0),
         }
 
+    def _build_failure_context(self, run_record: Dict[str, Any]) -> Dict[str, Any]:
+        failure_events = []
+        for event in reversed(run_record.get("events", []) or []):
+            event_type = str(event.get("event_type") or "")
+            if any(token in event_type.upper() for token in {"FAILED", "DENIED", "ERROR", "REJECTED"}):
+                failure_events.append({
+                    "event_type": event_type,
+                    "status_after": event.get("status_after"),
+                    "payload": dict(event.get("payload") or {}),
+                })
+        failure_events = failure_events[:5]
+        latest_failure = failure_events[0] if failure_events else None
+        if latest_failure is None and run_record.get("status") == "FAILED":
+            latest_failure = {
+                "event_type": "RUN_FINALIZED",
+                "status_after": "FAILED",
+                "payload": {"error": run_record.get("error")},
+            }
+        return {
+            "error": run_record.get("error"),
+            "latest_failure": latest_failure,
+            "events": failure_events,
+        }
+
     def get_run(self, run_id: str) -> Dict[str, Any]:
         with self._state_lock:
             run_record = self._sync_run_state(run_id)
@@ -3018,6 +3245,44 @@ class RuntimeService:
                 "provider_routing": run_record.get("provider_routing"),
                 "selected_provider": run_record.get("selected_provider"),
                 "summary": self._build_run_summary(run_record),
+            }
+
+    def get_run_progress(self, run_id: str) -> Dict[str, Any]:
+        with self._state_lock:
+            run_record = self._sync_run_state(run_id)
+            workflow_execution = self.kernel.workflow_executions.get(run_record["execution_id"])
+            checkpoint_id = run_record.get("checkpoint_id") or run_record.get("latest_checkpoint_id")
+            checkpoint = self.get_checkpoint(checkpoint_id) if checkpoint_id else None
+            active_steps = []
+            if workflow_execution is not None:
+                for step_execution_id in getattr(workflow_execution, "active_executions", []) or []:
+                    step_execution = self.kernel.step_executions.get(step_execution_id)
+                    if step_execution is not None:
+                        active_steps.append(step_execution.step_id)
+            recent_events = []
+            for event in (run_record.get("events", []) or [])[-8:]:
+                recent_events.append({
+                    "event_type": event.get("event_type"),
+                    "status_after": event.get("status_after"),
+                    "payload": dict(event.get("payload") or {}),
+                })
+            return {
+                "run_id": run_record["run_id"],
+                "status": run_record["status"],
+                "workflow_name": run_record["workflow_name"],
+                "workflow_path": run_record.get("workflow_path"),
+                "progress": {
+                    "completed_steps": run_record.get("completed_steps", []),
+                    "active_steps": active_steps,
+                    "artifact_count": len(run_record.get("artifacts", [])),
+                    "last_updated_at": run_record.get("last_updated_at"),
+                    "last_event_id": run_record.get("last_event_id"),
+                },
+                "recent_events": recent_events,
+                "checkpoint": checkpoint,
+                "latest_checkpoint_id": checkpoint_id,
+                "resume_hint": self._build_resume_hint(run_record),
+                "failure_context": self._build_failure_context(run_record),
             }
 
     def observe_run(self, run_id: str) -> Dict[str, Any]:
@@ -3279,7 +3544,10 @@ class RuntimeService:
             self._record_run_event(run_id, "RUN_FINALIZED", {"status": "CANCELLED"}, status="CANCELLED", source="bridge")
             return {"accepted": True, "status": "CANCELLED", "run_id": run_id, "message": "run cancelled"}
 
-    def respond_approval(self, run_id: str, choice: str) -> Dict[str, Any]:
+    def respond_approval(self, run_id: str, approval_id: Optional[str] = None, choice: str = "approve") -> Dict[str, Any]:
+        normalized_choice = str(choice or "").strip().lower()
+        if normalized_choice in {"deny", "reject", "no", "block"}:
+            return self._respond_deny_approval(run_id, approval_id)
         with self._state_lock:
             summary = self.get_run(run_id)
             if summary["status"] != "WAITING_APPROVAL":
@@ -3289,7 +3557,6 @@ class RuntimeService:
                     "message": "workflow is not waiting for approval",
                 }
 
-            normalized_choice = str(choice or "").strip().lower()
             if normalized_choice != "approve":
                 return {
                     "accepted": False,
@@ -3300,7 +3567,12 @@ class RuntimeService:
             execution_id = summary["execution_id"]
             self.kernel.approve_workflow(execution_id, approved_by="ui-user", reason="approved", comment=None)
             self._record_run_event(run_id, "CONTROL_RESPONDED", {"choice": "approve"}, status="RUNNING", source="bridge")
-            self._advance_workflow(execution_id)
+            self._advance_workflow(
+                execution_id,
+                provider=summary.get("resume_provider") or "stub",
+                model_name=summary.get("resume_model_name"),
+                endpoint=summary.get("resume_endpoint"),
+            )
             updated = self.get_run(run_id)
             return {
                 "accepted": True,
@@ -3308,6 +3580,40 @@ class RuntimeService:
                 "run_id": run_id,
                 "message": "approval recorded",
             }
+
+    def _respond_deny_approval(self, run_id: str, approval_id: Optional[str]) -> Dict[str, Any]:
+        """Route a deny-family choice for ``respond_approval``.
+
+        Without an explicit ``approval_id``, fall back to the first
+        pending tool approval for this run; if none exists, cancel the
+        run as the terminal negative (matches the semantics of
+        ``deny_tool_request`` and ``cancel_run`` respectively).
+        """
+        explicit_approval_id = approval_id
+        if not explicit_approval_id:
+            pending_approvals = self.list_pending_tool_approvals(run_id)
+            if pending_approvals:
+                explicit_approval_id = pending_approvals[0].get("approval_id")
+
+        if explicit_approval_id:
+            result = self.deny_tool_request(run_id, explicit_approval_id, denied_by="ui-user", reason="denied", comment=None)
+            if isinstance(result, dict) and result.get("status") in {"DENIED", "REJECTED"}:
+                return {
+                    "accepted": True,
+                    "status": result.get("status", "DENIED"),
+                    "run_id": run_id,
+                    "approval_id": explicit_approval_id,
+                    "message": result.get("message") or "approval denied",
+                }
+            # deny_tool_request returned an error (e.g. NOT_FOUND); surface
+            # it rather than silently swallowing the user's intent.
+            if isinstance(result, dict):
+                return result
+            return {"accepted": False, "status": "DENY_FAILED", "run_id": run_id, "message": "deny_tool_request failed"}
+
+        # No pending tool approval to deny: treat as workflow-level rejection
+        # and cancel the run (terminal negative), mirroring ``cancel_run``.
+        return self.cancel_run(run_id)
 
     def approve_tool_request(
         self,

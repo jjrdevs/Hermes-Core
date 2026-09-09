@@ -163,7 +163,7 @@ class SQLiteToolStore:
 
     def add(self, tool: Tool) -> None:
         self.connection.execute(
-            "INSERT INTO tools (tool_id, name, description, actions, allowed_roles, metadata, tool_hash, payload) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT OR REPLACE INTO tools (tool_id, name, description, actions, allowed_roles, metadata, tool_hash, payload) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 tool.tool_id,
                 tool.name,

@@ -2081,3 +2081,55 @@ class TestRuntimeRunner(unittest.TestCase):
             self.assertEqual(recovered_step.policy_context["policy_ids"], ["file-maintenance"])
             self.assertEqual(recovered_step.policy_context["approved"], True)
             recovered_kernel.shutdown()
+    def test_register_tool_refreshes_stale_persisted_definition(self):
+        """A workflow re-declaring an existing tool_id with an *evolved* definition
+        is an override, not a conflict: the stale persisted row (loaded from
+        tools.db by a previous process) must not crash the current run.
+        Regression guard for the "Immutable tool conflict for id filesystem"
+        failure seen after a prior scratch_write run left a different definition
+        in the shared tools.db.
+        """
+        with tempfile.TemporaryDirectory() as temp_dir:
+            event_db = Path(temp_dir) / "events.db"
+            artifact_db = Path(temp_dir) / "artifacts.db"
+            kernel = RuntimeKernel(event_db, artifact_db)
+
+            original = Tool(
+                tool_id="filesystem",
+                name="Filesystem Tool",
+                description="file read/write",
+                actions=["read", "read_file", "list_directory", "write", "write_file", "create_file"],
+                allowed_roles=["developer"],
+                metadata={"allowed_roots": [temp_dir]},
+            )
+            kernel.register_tool(original)
+            self.assertEqual(kernel.tool_store.get("filesystem").actions, original.actions)
+            kernel.shutdown()
+
+            recovered = RuntimeKernel(event_db, artifact_db)
+            self.assertEqual(
+                recovered.tool_store.get("filesystem").actions,
+                original.actions,
+            )
+
+            evolved = Tool(
+                tool_id="filesystem",
+                name="Filesystem",
+                description="Read/write within workspace",
+                actions=["read_file", "write_file", "list_directory"],
+                allowed_roles=["developer"],
+                metadata={"allowed_roots": [temp_dir]},
+            )
+            # Must not raise "Immutable tool conflict" / "Tool conflict".
+            recovered.register_tool(evolved)
+            self.assertEqual(recovered.tool_store.get("filesystem").actions, evolved.actions)
+            self.assertEqual(recovered.tool_store.get("filesystem").description, evolved.description)
+            recovered.shutdown()
+
+            after_restart = RuntimeKernel(event_db, artifact_db)
+            self.assertEqual(
+                after_restart.tool_store.get("filesystem").actions,
+                evolved.actions,
+                "stale persisted definition overwritten on disk",
+            )
+            after_restart.shutdown()

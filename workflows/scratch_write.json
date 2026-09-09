@@ -1,0 +1,45 @@
+{
+  "name": "scratch_write",
+  "description": "p7a smoke: create one file in the workspace.",
+  "steps": [
+    {
+      "id": "write",
+      "role": "developer",
+      "objective": {
+        "description": "Use the file tool to CREATE a file named p7a_proof.txt containing exactly the text P7A_OK. One write_file call only."
+      },
+      "depends_on": [],
+      "outputs": [
+        "artifact"
+      ],
+      "constraints": {
+        "allowed_tools": [
+          "filesystem"
+        ]
+      }
+    }
+  ],
+  "transitions": [],
+  "tools": [
+    {
+      "tool_id": "filesystem",
+      "name": "Filesystem Tool",
+      "description": "file read/write",
+      "actions": [
+        "read",
+        "read_file",
+        "list_directory",
+        "write",
+        "write_file",
+        "create_file"
+      ],
+      "allowed_roles": [
+        "developer"
+      ],
+      "metadata": {
+        "version": "1.0"
+      }
+    }
+  ],
+  "policy_refs": []
+}

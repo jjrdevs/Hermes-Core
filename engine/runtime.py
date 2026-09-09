@@ -334,8 +334,16 @@ class RuntimeKernel:
     def register_tool(self, tool: Tool) -> None:
         existing = self.tool_store.get(tool.tool_id)
         if existing is not None:
-            if existing.compute_tool_hash() != tool.compute_tool_hash():
-                raise ValueError(f"Immutable tool conflict for id {tool.tool_id}")
+            if existing.compute_tool_hash() == tool.compute_tool_hash():
+                return
+            # A workflow re-declaring the same tool_id with an evolved definition
+            # (e.g. after an upgrade) is a legitimate override, not a conflict.
+            # Upsert the persisted row and replace the live registry entry so
+            # the current workflow definition always wins over a stale one
+            # loaded from tools.db.
+            self.tool_store.add(tool)
+            self.tool_registry.replace(tool)
+            self.capability_registry.register_tool(tool.tool_id, tool.to_dict())
             return
         self.tool_store.add(tool)
         self.tool_registry.register(tool)

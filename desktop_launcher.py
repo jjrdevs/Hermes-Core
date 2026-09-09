@@ -12,16 +12,21 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import json
 import os
 import platform
+import re
 import shutil
 import subprocess
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Optional
-from urllib import request
+from urllib import parse, request
 import webbrowser
+
+
+DEFAULT_TUNNEL_RESTART_ON_ERRORS = True
 
 # Import tkinter lazily and handle missing Tcl/Tk libraries gracefully. When
 # PyInstaller bundles the binary on systems that do not have the matching
@@ -41,6 +46,45 @@ except Exception as _tk_exc:  # pragma: no cover - runtime-dependent
 
 DEFAULT_WEBUI_URL = os.getenv("HERMES_WEBUI_URL", "http://127.0.0.1:8787")
 DEFAULT_LOCAL_WEBUI_PORT = int(os.getenv("HERMES_LOCAL_WEBUI_PORT", "8765"))
+DEFAULT_TUNNEL_ENABLED = os.getenv("HERMES_WEBUI_TUNNEL_ENABLED", "0").strip().lower() in {"1", "true", "yes", "on"}
+DEFAULT_TUNNEL_BINARY = os.getenv("HERMES_CLOUDFLARED_BINARY", "cloudflared")
+DEFAULT_TUNNEL_MODE = os.getenv("HERMES_WEBUI_TUNNEL_MODE", "url").strip().lower()
+DEFAULT_TUNNEL_TARGET = os.getenv("HERMES_WEBUI_TUNNEL_TARGET", DEFAULT_WEBUI_URL)
+DEFAULT_TUNNEL_LOG_FILE = os.getenv("HERMES_WEBUI_TUNNEL_LOG_FILE", os.path.join(os.path.expanduser("~/.hermes"), "webui-tunnel.log"))
+DEFAULT_TUNNEL_PID_FILE = os.getenv("HERMES_WEBUI_TUNNEL_PID_FILE", os.path.join(os.path.expanduser("~/.hermes"), "webui-tunnel.pid"))
+DEFAULT_TUNNEL_CONFIG_PATH = os.getenv("HERMES_WEBUI_TUNNEL_CONFIG", os.path.expanduser("~/.cloudflared/config.yml"))
+
+
+def extract_tunnel_url(text: str) -> Optional[str]:
+    match = re.search(r"https://[A-Za-z0-9.-]+\.trycloudflare\.com", text)
+    if match:
+        return match.group(0)
+    return None
+
+
+def should_restart_tunnel(lines: list[str]) -> bool:
+    text = "\n".join(lines).lower()
+    if "stream" in text and "canceled by remote" in text:
+        return True
+    if "failed to serve tunnel connection" in text:
+        return True
+    if "timeout: no recent network activity" in text:
+        return True
+    return False
+
+
+def resolve_cloudflared_config_path() -> Optional[str]:
+    config_path = os.getenv("HERMES_WEBUI_TUNNEL_CONFIG") or DEFAULT_TUNNEL_CONFIG_PATH
+    if not config_path:
+        return None
+    config_path = os.path.expanduser(config_path)
+    return config_path if os.path.exists(config_path) else None
+
+
+def build_cloudflared_start_command(target_url: str, *, config_path: Optional[str], binary: str) -> list[str]:
+    if config_path and os.path.exists(config_path):
+        return [binary, "tunnel", "--config", config_path, "run"]
+    return [binary, "tunnel", "--url", target_url, "--protocol", "http2", "--edge-bind-address", "0.0.0.0"]
 
 
 class HermesDesktopLauncher:
@@ -52,14 +96,28 @@ class HermesDesktopLauncher:
 
         self.url_var = tk.StringVar(value=self._default_url())
         self.status_var = tk.StringVar(value="Ready")
+        self.tunnel_url_var = tk.StringVar(value="")
         self._core_process: Optional[subprocess.Popen] = None
         self._webui_server: Optional[ThreadingHTTPServer] = None
         self._webui_thread: Optional[threading.Thread] = None
         self._tray_icon = None
+        self._tunnel_process: Optional[subprocess.Popen] = None
+        self._tunnel_thread: Optional[threading.Thread] = None
+        self._tunnel_log_path = DEFAULT_TUNNEL_LOG_FILE
+        self._tunnel_pid_file = DEFAULT_TUNNEL_PID_FILE
+        self._tunnel_enabled = DEFAULT_TUNNEL_ENABLED
+        self._tunnel_target = DEFAULT_TUNNEL_TARGET
+        self._tunnel_restart_state = {"recent_error_count": 0, "last_restart_at": 0.0}
+        self._last_notified_tunnel_url: Optional[str] = None
 
+        self._load_tunnel_settings_from_env()
         self._build_ui()
         self._setup_tray_icon()
         self.root.protocol("WM_DELETE_WINDOW", self._hide_to_tray)
+
+        self._restore_tunnel_url_from_log()
+        if self._tunnel_enabled:
+            self._start_cloudflared_tunnel(self._tunnel_target)
 
     def _default_url(self) -> str:
         return os.getenv("HERMES_WEBUI_URL", DEFAULT_WEBUI_URL)
@@ -84,6 +142,10 @@ class HermesDesktopLauncher:
         tk.Label(frame, text="Status:").grid(row=2, column=0, sticky="w", pady=(14, 0))
         status = tk.Label(frame, textvariable=self.status_var, wraplength=420, justify="left")
         status.grid(row=2, column=1, sticky="w", pady=(14, 0))
+
+        tk.Label(frame, text="Tunnel URL:").grid(row=3, column=0, sticky="w", pady=(8, 0))
+        tunnel_url = tk.Label(frame, textvariable=self.tunnel_url_var, wraplength=420, justify="left", fg="#0b57d0")
+        tunnel_url.grid(row=3, column=1, sticky="w", pady=(8, 0))
 
         frame.columnconfigure(1, weight=1)
 
@@ -129,6 +191,7 @@ class HermesDesktopLauncher:
     def _quit(self) -> None:
         self.stop_local_webui_server()
         self.stop_core_process()
+        self._stop_cloudflared_process()
         self.root.destroy()
 
     def _is_http_ready(self, url: str) -> bool:
@@ -182,6 +245,186 @@ class HermesDesktopLauncher:
                 return path
         return None
 
+    def _resolve_cloudflared_binary(self) -> Optional[str]:
+        binary = os.getenv("HERMES_CLOUDFLARED_BINARY", DEFAULT_TUNNEL_BINARY)
+        if binary and os.path.isabs(binary) and os.path.isfile(binary):
+            return binary
+        if shutil.which(binary):
+            return shutil.which(binary)
+        return shutil.which("cloudflared")
+
+    def _load_tunnel_settings_from_env(self) -> None:
+        env_file = os.path.expanduser("~/Applications/hermes-webui/.env")
+        if not os.path.exists(env_file):
+            return
+        try:
+            with open(env_file, "r", encoding="utf-8") as handle:
+                for raw_line in handle:
+                    line = raw_line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    if "=" not in line:
+                        continue
+                    key, value = line.split("=", 1)
+                    key = key.strip()
+                    value = value.strip()
+                    if key == "HERMES_WEBUI_TUNNEL_ENABLED" and value.lower() in {"1", "true", "yes", "on"}:
+                        self._tunnel_enabled = True
+                    elif key == "HERMES_WEBUI_TUNNEL_ENABLED" and value.lower() in {"0", "false", "no", "off"}:
+                        self._tunnel_enabled = False
+                    elif key == "HERMES_WEBUI_TUNNEL_TARGET":
+                        self._tunnel_target = value
+        except Exception:
+            return
+
+    def _restore_tunnel_url_from_log(self) -> None:
+        if not os.path.exists(self._tunnel_log_path):
+            return
+        try:
+            with open(self._tunnel_log_path, "r", encoding="utf-8", errors="ignore") as handle:
+                text = handle.read()
+        except Exception:
+            return
+        tunnel_url = extract_tunnel_url(text)
+        if tunnel_url:
+            self.tunnel_url_var.set(tunnel_url)
+            self.status_var.set(f"Tunnel ready: {tunnel_url}")
+
+    def _notify_tunnel_url(self, tunnel_url: str) -> None:
+        webhook_url = os.getenv("HERMES_TUNNEL_NOTIFY_URL") or os.getenv("DISCORD_WEBHOOK_URL")
+        if not webhook_url or tunnel_url == self._last_notified_tunnel_url:
+            return
+
+        self._last_notified_tunnel_url = tunnel_url
+        message = os.getenv("HERMES_TUNNEL_NOTIFY_MESSAGE", f"Hermes tunnel ready: {tunnel_url}")
+        payload = json.dumps({"content": message}).encode("utf-8")
+        req = request.Request(
+            webhook_url,
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with request.urlopen(req, timeout=10) as response:
+                if getattr(response, "status", None) and response.status >= 400:
+                    self.status_var.set(f"Tunnel notification failed with HTTP {response.status}")
+        except Exception as exc:  # pragma: no cover - network dependent
+            self.status_var.set(f"Could not send tunnel notification: {exc}")
+
+    def _set_tunnel_url(self, tunnel_url: Optional[str]) -> None:
+        if tunnel_url:
+            self.tunnel_url_var.set(tunnel_url)
+            self.status_var.set(f"Tunnel ready: {tunnel_url}")
+            self._notify_tunnel_url(tunnel_url)
+
+    def _refresh_tunnel_url_from_log(self) -> None:
+        if not os.path.exists(self._tunnel_log_path):
+            return
+        try:
+            with open(self._tunnel_log_path, "r", encoding="utf-8", errors="ignore") as handle:
+                text = handle.read()
+        except Exception:
+            return
+        tunnel_url = extract_tunnel_url(text)
+        if tunnel_url:
+            self._set_tunnel_url(tunnel_url)
+
+    def _start_cloudflared_tunnel(self, target_url: str) -> bool:
+        if self._tunnel_process is not None and self._tunnel_process.poll() is None:
+            return True
+
+        binary = self._resolve_cloudflared_binary()
+        if binary is None:
+            self.status_var.set("cloudflared is not installed or not on PATH")
+            return False
+
+        os.makedirs(os.path.dirname(self._tunnel_log_path), exist_ok=True)
+        os.makedirs(os.path.dirname(self._tunnel_pid_file), exist_ok=True)
+
+        config_path = resolve_cloudflared_config_path()
+        if config_path:
+            self.status_var.set(f"Starting Cloudflare tunnel from config {config_path}...")
+        else:
+            self.status_var.set(f"Starting Cloudflare tunnel to {target_url} using URL mode...")
+
+        command = build_cloudflared_start_command(target_url, config_path=config_path, binary=binary)
+        try:
+            proc = subprocess.Popen(
+                command,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                env=os.environ.copy(),
+                cwd=os.path.dirname(os.path.abspath(__file__)),
+                text=True,
+                start_new_session=True,
+            )
+        except Exception as exc:
+            self.status_var.set(f"Could not start cloudflared: {exc}")
+            return False
+
+        self._tunnel_process = proc
+        try:
+            with open(self._tunnel_pid_file, "w", encoding="utf-8") as pid_file:
+                pid_file.write(str(proc.pid))
+        except Exception:
+            pass
+
+        self._tunnel_thread = threading.Thread(
+            target=self._monitor_tunnel_output,
+            args=(proc,),
+            daemon=True,
+        )
+        self._tunnel_thread.start()
+        return True
+
+    def _restart_tunnel_if_needed(self, line: str) -> None:
+        if not DEFAULT_TUNNEL_RESTART_ON_ERRORS:
+            return
+        now = time.time()
+        if now - self._tunnel_restart_state["last_restart_at"] < 20:
+            return
+        self._tunnel_restart_state["last_restart_at"] = now
+        if self._tunnel_process is not None and self._tunnel_process.poll() is None:
+            with contextlib.suppress(Exception):
+                self._tunnel_process.terminate()
+            self._tunnel_process = None
+            self.status_var.set("Cloudflare tunnel dropped; restarting it...")
+            self._start_cloudflared_tunnel(self._tunnel_target)
+
+    def _monitor_tunnel_output(self, proc: subprocess.Popen) -> None:
+        error_lines: list[str] = []
+        try:
+            with open(self._tunnel_log_path, "a", encoding="utf-8") as log_file:
+                if proc.stdout is None:
+                    return
+                for raw_line in proc.stdout:
+                    line = raw_line.rstrip("\n")
+                    log_file.write(line + "\n")
+                    log_file.flush()
+                    tunnel_url = extract_tunnel_url(line)
+                    if tunnel_url:
+                        self._set_tunnel_url(tunnel_url)
+                    elif "Error" in line or "error" in line:
+                        self.status_var.set(f"Cloudflare tunnel: {line.strip()}")
+                        error_lines.append(line)
+                        if should_restart_tunnel(error_lines[-3:]):
+                            self._restart_tunnel_if_needed(line)
+        finally:
+            if proc.poll() is not None and self._tunnel_process is proc:
+                self._tunnel_process = None
+                self.status_var.set("Cloudflare tunnel stopped")
+
+    def _stop_cloudflared_process(self) -> None:
+        if self._tunnel_process is None:
+            return
+        if self._tunnel_process.poll() is None:
+            with contextlib.suppress(Exception):
+                self._tunnel_process.terminate()
+        self._tunnel_process = None
+        with contextlib.suppress(Exception):
+            os.remove(self._tunnel_pid_file)
+
     def _start_real_webui_server(self, url: str) -> bool:
         if self._is_http_ready(url):
             return True
@@ -229,6 +472,8 @@ class HermesDesktopLauncher:
                 self.status_var.set(f"Could not start Hermes WebUI. Opening {url} anyway.")
 
         try:
+            if self._tunnel_enabled:
+                self._start_cloudflared_tunnel(url)
             webbrowser.open(url, new=0)
             self.status_var.set(f"Opened {url} in your default browser")
         except Exception as exc:  # pragma: no cover - runtime environment dependent

@@ -41,6 +41,10 @@ class HermesHttpAdapter:
             if not self.enabled:
                 return {"accepted": False, "status": "disabled", "message": f"{action} is disabled for the legacy adapter"}
             return self.api.get_run(payload["run_id"])
+        if action in {"get_run_progress", "progress"}:
+            if not self.enabled:
+                return {"accepted": False, "status": "disabled", "message": f"{action} is disabled for the legacy adapter"}
+            return self.api.get_run_progress(payload["run_id"])
         if action in {"observe_run", "observe"}:
             if not self.enabled:
                 return {"accepted": False, "status": "disabled", "message": f"{action} is disabled for the legacy adapter"}
@@ -53,6 +57,10 @@ class HermesHttpAdapter:
             return self.api.list_checkpoints()
         if action == "get_checkpoint":
             return self.api.get_checkpoint(payload["checkpoint_id"])
+        if action in {"get_change_record", "get_change"}:
+            return self.api.get_change_record(payload["checkpoint_id"])
+        if action in {"rollback_checkpoint", "rollback"}:
+            return self.api.rollback_checkpoint(payload["checkpoint_id"], actor=payload.get("actor", "api-user"), reason=payload.get("reason", "rollback requested"))
         if action in {"cancel_run", "cancel"}:
             if not self.enabled:
                 return {"accepted": False, "status": "disabled", "message": f"{action} is disabled for the legacy adapter"}

@@ -16,6 +16,13 @@ class ToolRegistry:
             raise ValueError(f"Tool conflict for id {tool.tool_id}")
         self._tools[tool.tool_id] = tool
 
+    def replace(self, tool: Tool) -> None:
+        """Unconditionally overwrite any existing entry for tool.tool_id.
+        Use for workflow re-declaration overrides, not for external
+        callers that must detect conflicts.
+        """
+        self._tools[tool.tool_id] = tool
+
     def get(self, tool_id: str) -> Optional[Tool]:
         return self._tools.get(tool_id)
 

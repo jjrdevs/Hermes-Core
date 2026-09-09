@@ -1,0 +1,30 @@
+{
+  "type": "object",
+  "properties": {
+    "url": {
+      "type": "string",
+      "description": "The URL to crawl and analyze"
+    },
+    "analyze_performance": {
+      "type": "boolean", 
+      "default": true,
+      "description": "Whether to analyze performance metrics"
+    },
+    "check_assets": {
+      "type": "boolean",
+      "default": true,
+      "description": "Whether to check image and asset optimization"
+    },
+    "generate_recommendations": {
+      "type": "boolean",
+      "default": true,
+      "description": "Whether to generate optimization recommendations"
+    },
+    "reconstruct_site": {
+      "type": "boolean",
+      "default": false,
+      "description": "Whether to gather information for site recreation"
+    }
+  },
+  "required": ["url"]
+}

@@ -1,0 +1,16 @@
+{
+  "name": "coding",
+  "description": "Default webui coding pipeline: plan, human approval gate, implement, verify. Steps use the FilesystemTool so the worker can read and edit files in the job workspace. Writes stay gated by the run capability contract (writable_paths) and the workflow allowed_tools.",
+  "steps": [
+    {"id": "plan", "role": "architect", "objective": {"description": "Analyze the task brief and produce a concrete implementation plan: which files to create or edit, the approach, and the acceptance criteria."}, "depends_on": [], "outputs": ["implementation_plan"], "constraints": {"allowed_tools": ["filesystem"]}},
+    {"id": "implement", "role": "developer", "objective": {"description": "Implement the approved plan by creating or editing files, keeping changes minimal, correct, and scoped to the workspace."}, "depends_on": ["plan"], "outputs": ["implementation_artifact"], "constraints": {"allowed_tools": ["filesystem"]}},
+    {"id": "verify", "role": "developer", "objective": {"description": "Review the implementation against the acceptance criteria, read back the changed files, and report any gaps."}, "depends_on": ["implement"], "outputs": ["verification_report"], "constraints": {"allowed_tools": ["filesystem"]}}
+  ],
+  "transitions": [
+    {"priority": 100, "condition": {"event": "STEP_COMPLETED", "artifact_type": "implementation_plan"}, "action": {"require_approval": {"role": "human_operator"}}}
+  ],
+  "tools": [
+    {"tool_id": "filesystem", "name": "Filesystem Tool", "description": "Local filesystem read and edit capability for planning, implementing, and verifying code changes.", "actions": ["read", "read_file", "list_directory", "search_text", "search_files", "write", "write_file", "create_file"], "allowed_roles": ["architect", "developer"], "metadata": {"version": "1.0"}}
+  ],
+  "policy_refs": []
+}

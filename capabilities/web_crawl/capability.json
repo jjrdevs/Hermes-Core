@@ -1,0 +1,9 @@
+{
+  "capability": "web_crawl",
+  "description": "Comprehensive website crawling and optimization analysis for performance improvements, with support for site reconstruction",
+  "required_features": ["web", "crawl", "analysis", "optimization"],
+  "preferred_context_window": 32768,
+  "requires_tool_support": true,
+  "tool_ids": ["web_extract", "terminal"],
+  "allowed_roles": ["researcher", "architect", "developer", "analyst"]
+}

@@ -33,7 +33,7 @@ Example capability metadata:
     "code": true,
     "reasoning": true,
     "planning": true,
-    "tool_use": false,
+    "tool_use": true,
     "vision": false,
     "structured_output": true
   },
