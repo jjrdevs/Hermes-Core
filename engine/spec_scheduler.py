@@ -36,6 +36,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
 from .schedule_parse import ParsedSchedule, ScheduleError
+from workers.model_adapter import DEFAULT_PROVIDER
 
 
 # ---------------------------------------------------------------------------
@@ -595,7 +596,7 @@ def _default_executor_for(runtime_service: Optional[Any] = None) -> Executor:
         try:
             result = service.queue_run(
                 spec.workflow,
-                provider=spec.provider or "stub",
+                provider=spec.provider or DEFAULT_PROVIDER,
                 model_name=spec.model_name,
                 endpoint=spec.endpoint,
                 context=spec.context,

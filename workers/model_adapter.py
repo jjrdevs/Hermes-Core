@@ -1,12 +1,23 @@
 from __future__ import annotations
 
 import json
+import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Union
 from urllib import error, request
 
 DEFAULT_ENDPOINT = "http://localhost:11434"
+
+# Default provider + model (user-requested 2026-09-10: "set hermes-core to
+# qwen3.8 27b, defaulted to the fast variant"). ``qwen38-fast-128k`` is the
+# local Ollama fast variant of Qwen 3.8 27b, already proven to serve this box
+# at ~170-185 tok/s decode / 300 tok/s prefill. Override with
+# ``HERMES_CORE_DEFAULT_MODEL`` / ``HERMES_CORE_DEFAULT_PROVIDER`` to change
+# the routing target without code edits (e.g. ``ministral-small`` for
+# ultra-trivial in-app tasks).
+DEFAULT_PROVIDER = os.environ.get("HERMES_CORE_DEFAULT_PROVIDER", "ollama")
+DEFAULT_MODEL = os.environ.get("HERMES_CORE_DEFAULT_MODEL", "qwen38-fast-128k")
 
 
 # Executor contract for generate_with_tools:
@@ -42,7 +53,7 @@ class ChatResult:
 
 @dataclass(frozen=True)
 class ModelAdapterConfig:
-    provider: str = "stub"
+    provider: str = DEFAULT_PROVIDER
     model_name: Optional[str] = None
     endpoint: Optional[str] = None
     api_key: Optional[str] = None
@@ -178,8 +189,14 @@ class StubModelAdapter(ModelAdapter):
 class OllamaModelAdapter(ModelAdapter):
     def __init__(self, config: Optional[ModelAdapterConfig] = None) -> None:
         super().__init__(config)
+        # Default model falls back to the repo-level DEFAULT_MODEL
+        # (``qwen38-fast-128k`` by default, user-requested 2026-09-10) so a
+        # bare ``provider="ollama"`` call routes to the local fast-variant
+        # Qwen 3.8 27b instead of a stale ``llama3.1`` tag that may not exist
+        # on the local Ollama install.
+        default_model = DEFAULT_MODEL
         self._capabilities = {
-            "name": self.config.model_name or "llama3.1",
+            "name": self.config.model_name or default_model,
             "provider": "ollama",
             "capabilities": {
                 "code": True,

@@ -4,6 +4,7 @@ import json
 from typing import Any, Dict, Optional
 
 from engine.api import HermesApi
+from workers.model_adapter import DEFAULT_PROVIDER
 
 
 class HermesHttpAdapter:
@@ -16,13 +17,13 @@ class HermesHttpAdapter:
         if action in {"run_task", "task"}:
             return self.api.run_task(payload["task"], workspace_path=payload.get("workspace_path"), context=payload.get("context"))
         if action == "run_workflow":
-            return self.api.run_workflow(payload["workflow_path"], provider=payload.get("provider", "stub"), model_name=payload.get("model_name"), endpoint=payload.get("endpoint"))
+            return self.api.run_workflow(payload["workflow_path"], provider=payload.get("provider", DEFAULT_PROVIDER), model_name=payload.get("model_name"), endpoint=payload.get("endpoint"))
         if action in {"start_run", "start"}:
             if not self.enabled:
                 return {"accepted": False, "status": "disabled", "message": f"{action} is disabled for the legacy adapter"}
             return self.api.start_run(
                 payload["workflow_path"],
-                provider=payload.get("provider", "stub"),
+                provider=payload.get("provider", DEFAULT_PROVIDER),
                 model_name=payload.get("model_name"),
                 endpoint=payload.get("endpoint"),
                 context=payload.get("context"),
@@ -32,7 +33,7 @@ class HermesHttpAdapter:
                 return {"accepted": False, "status": "disabled", "message": f"{action} is disabled for the legacy adapter"}
             return self.api.queue_run(
                 payload["workflow_path"],
-                provider=payload.get("provider", "stub"),
+                provider=payload.get("provider", DEFAULT_PROVIDER),
                 model_name=payload.get("model_name"),
                 endpoint=payload.get("endpoint"),
                 context=payload.get("context"),

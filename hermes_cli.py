@@ -27,7 +27,7 @@ def _format_job_status(row: Any) -> str:
     return f"status={row['status']} checkpoint={checkpoint_id or 'none'} resume={str(can_resume).lower()}"
 from engine.workflow_loader import load_json_file, resolve_data_paths, resolve_input_path
 from workers.local_worker import LocalWorker
-from workers.model_adapter import ModelAdapterConfig, ModelAdapterFactory
+from workers.model_adapter import DEFAULT_PROVIDER, ModelAdapterConfig, ModelAdapterFactory
 
 DEFAULT_DATA_DIR = Path.home() / ".hermes" / "data"
 ALLOWED_EVENT_NAMES = {"STEP_COMPLETED", "STEP_EXECUTION_COMPLETED", "ARTIFACT_CREATED"}
@@ -373,7 +373,7 @@ def print_artifacts(kernel: RuntimeKernel, workflow_execution_id: str) -> None:
 
 
 def _build_model_config(args: Optional[argparse.Namespace] = None) -> ModelAdapterConfig:
-    provider = "stub"
+    provider = DEFAULT_PROVIDER
     model_name = None
     endpoint = None
     if args is not None:
@@ -1108,14 +1108,14 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     run_parser = subparsers.add_parser("run", parents=[parent_parser], help="Run a workflow definition JSON file")
     run_parser.add_argument("workflow_json", help="Path to workflow JSON")
-    run_parser.add_argument("--provider", help="Model adapter provider (stub or ollama)", default="stub")
+    run_parser.add_argument("--provider", help="Model adapter provider (stub or ollama)", default=None)
     run_parser.add_argument("--model-name", help="Model name to use for the adapter", default=None)
     run_parser.add_argument("--endpoint", help="Remote endpoint for adapter providers", default=None)
     run_parser.add_argument("--dry-run", action="store_true", help="Preview workflow actions without executing them")
 
     resume_parser = subparsers.add_parser("resume", parents=[parent_parser], help="Resume a persisted workflow execution")
     resume_parser.add_argument("workflow_execution_id", help="Workflow execution id")
-    resume_parser.add_argument("--provider", help="Model adapter provider (stub or ollama)", default="stub")
+    resume_parser.add_argument("--provider", help="Model adapter provider (stub or ollama)", default=None)
     resume_parser.add_argument("--model-name", help="Model name to use for the adapter", default=None)
     resume_parser.add_argument("--endpoint", help="Remote endpoint for adapter providers", default=None)
     resume_parser.add_argument("--dry-run", action="store_true", help="Preview workflow resume actions without executing them")

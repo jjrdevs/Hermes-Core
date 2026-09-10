@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 from engine.runtime_service import RuntimeService
+from workers.model_adapter import DEFAULT_PROVIDER
 
 
 def _spec_job_outcome(o: Any) -> Dict[str, Any]:
@@ -33,7 +34,7 @@ class HermesApi:
         self,
         workflow_path: str,
         *,
-        provider: str = "stub",
+        provider: str = DEFAULT_PROVIDER,
         model_name: Optional[str] = None,
         endpoint: Optional[str] = None,
         context: Optional[Dict[str, Any]] = None,
@@ -53,7 +54,7 @@ class HermesApi:
         self,
         workflow_path: str,
         *,
-        provider: str = "stub",
+        provider: str = DEFAULT_PROVIDER,
         model_name: Optional[str] = None,
         endpoint: Optional[str] = None,
         context: Optional[Dict[str, Any]] = None,
@@ -64,7 +65,7 @@ class HermesApi:
         self,
         workflow_path: str,
         *,
-        provider: str = "stub",
+        provider: str = DEFAULT_PROVIDER,
         model_name: Optional[str] = None,
         endpoint: Optional[str] = None,
         context: Optional[Dict[str, Any]] = None,
@@ -234,7 +235,7 @@ class HermesApi:
         if action == "run_workflow":
             return self.run_workflow(
                 payload["workflow_path"],
-                provider=payload.get("provider", "stub"),
+                provider=payload.get("provider", DEFAULT_PROVIDER),
                 model_name=payload.get("model_name"),
                 endpoint=payload.get("endpoint"),
                 context=payload.get("context"),
@@ -242,7 +243,7 @@ class HermesApi:
         if action in {"start_run", "start"}:
             return self.start_run(
                 payload["workflow_path"],
-                provider=payload.get("provider", "stub"),
+                provider=payload.get("provider", DEFAULT_PROVIDER),
                 model_name=payload.get("model_name"),
                 endpoint=payload.get("endpoint"),
                 context=payload.get("context"),
@@ -250,7 +251,7 @@ class HermesApi:
         if action in {"queue_run", "queue"}:
             return self.queue_run(
                 payload["workflow_path"],
-                provider=payload.get("provider", "stub"),
+                provider=payload.get("provider", DEFAULT_PROVIDER),
                 model_name=payload.get("model_name"),
                 endpoint=payload.get("endpoint"),
                 context=payload.get("context"),

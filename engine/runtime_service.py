@@ -20,7 +20,7 @@ from engine.storage import SQLiteMemoryStore, SQLiteRunStore
 from engine.tool_runtime import FilesystemTool
 from engine.workflow_loader import build_tool_definitions, build_workflow_definition, load_json_file, resolve_data_paths, resolve_input_path
 from workers.local_worker import LocalWorker
-from workers.model_adapter import ModelAdapterConfig, ModelAdapterFactory, ModelAdapterRouter, OllamaModelAdapter, ProviderProfile
+from workers.model_adapter import DEFAULT_PROVIDER, ModelAdapterConfig, ModelAdapterFactory, ModelAdapterRouter, OllamaModelAdapter, ProviderProfile
 
 # Normalizer for c3: the webui/`custom` provider is an OpenAI-compatible
 # endpoint (Ollama, OpenRouter, any OpenAI-clone). The in-core "ollama"
@@ -74,7 +74,7 @@ class RuntimeService:
         self.kernel.register_workflow_definition(workflow_definition)
         return workflow_definition
 
-    def _build_model_router(self, provider: str = "stub", model_name: Optional[str] = None, endpoint: Optional[str] = None, timeout_seconds: Optional[float] = None) -> ModelAdapterRouter:
+    def _build_model_router(self, provider: str = DEFAULT_PROVIDER, model_name: Optional[str] = None, endpoint: Optional[str] = None, timeout_seconds: Optional[float] = None) -> ModelAdapterRouter:
         # c3: normalize public provider label to the internal profile.
         # `custom`, `openai`, `openrouter`, `local` are all OpenAI-compatible
         # endpoints, and the in-core "ollama" profile is the concrete adapter
@@ -116,7 +116,7 @@ class RuntimeService:
             preferred_provider=provider,
         )
 
-    def _route_provider(self, prompt: str, provider: str = "stub", model_name: Optional[str] = None, endpoint: Optional[str] = None, timeout_seconds: Optional[float] = None):
+    def _route_provider(self, prompt: str, provider: str = DEFAULT_PROVIDER, model_name: Optional[str] = None, endpoint: Optional[str] = None, timeout_seconds: Optional[float] = None):
         router = self._build_model_router(provider=provider, model_name=model_name, endpoint=endpoint, timeout_seconds=timeout_seconds)
         decision = router.route(prompt, task_complexity="simple")
         if provider not in {profile.provider for profile in router.profiles}:
@@ -133,7 +133,7 @@ class RuntimeService:
             }
         return decision
 
-    def _build_model_adapter(self, provider: str = "stub", model_name: Optional[str] = None, endpoint: Optional[str] = None, timeout_seconds: Optional[float] = None):
+    def _build_model_adapter(self, provider: str = DEFAULT_PROVIDER, model_name: Optional[str] = None, endpoint: Optional[str] = None, timeout_seconds: Optional[float] = None):
         decision = self._route_provider("default runtime task", provider=provider, model_name=model_name, endpoint=endpoint, timeout_seconds=timeout_seconds)
         return decision.adapter
 
@@ -309,7 +309,7 @@ class RuntimeService:
         self,
         execution_id: str,
         *,
-        provider: str = "stub",
+        provider: str = DEFAULT_PROVIDER,
         model_name: Optional[str] = None,
         endpoint: Optional[str] = None,
         stop_on_pause: bool = False,
@@ -2331,7 +2331,7 @@ class RuntimeService:
         policy_context = self._normalize_policy_context(policy_context_input, strict=strict_policy)
         provider_routing = self._route_provider(
             task,
-            provider=context.get("provider", "stub"),
+            provider=context.get("provider", DEFAULT_PROVIDER),
             model_name=context.get("model_name"),
             endpoint=context.get("endpoint"),
         )
@@ -2873,7 +2873,7 @@ class RuntimeService:
             self.run_store.update(run_id, run_record)
             return run_record
 
-    def _run_workflow_in_background(self, run_id: str, execution_id: str, *, provider: str = "stub", model_name: Optional[str] = None, endpoint: Optional[str] = None) -> None:
+    def _run_workflow_in_background(self, run_id: str, execution_id: str, *, provider: str = DEFAULT_PROVIDER, model_name: Optional[str] = None, endpoint: Optional[str] = None) -> None:
         with self._state_lock:
             try:
                 self._sync_run_state(run_id)
@@ -2894,7 +2894,7 @@ class RuntimeService:
         self,
         workflow_path: str,
         *,
-        provider: str = "stub",
+        provider: str = DEFAULT_PROVIDER,
         model_name: Optional[str] = None,
         endpoint: Optional[str] = None,
         context: Optional[Dict[str, Any]] = None,
@@ -2917,7 +2917,7 @@ class RuntimeService:
         self,
         workflow_path: str,
         *,
-        provider: str = "stub",
+        provider: str = DEFAULT_PROVIDER,
         model_name: Optional[str] = None,
         endpoint: Optional[str] = None,
         context: Optional[Dict[str, Any]] = None,
@@ -2977,7 +2977,7 @@ class RuntimeService:
         self,
         workflow_path: str,
         *,
-        provider: str = "stub",
+        provider: str = DEFAULT_PROVIDER,
         model_name: Optional[str] = None,
         endpoint: Optional[str] = None,
         context: Optional[Dict[str, Any]] = None,
@@ -3098,7 +3098,7 @@ class RuntimeService:
                 target=self._run_queued_workflow,
                 args=(run_id, execution_id),
                 kwargs={
-                    "provider": run_record.get("resume_provider") or "stub",
+                    "provider": run_record.get("resume_provider") or DEFAULT_PROVIDER,
                     "model_name": run_record.get("resume_model_name"),
                     "endpoint": run_record.get("resume_endpoint"),
                 },
@@ -3121,14 +3121,14 @@ class RuntimeService:
             self._record_run_event(run_id, "CONTROL_RESPONDED", {"choice": "approve", "mode": "auto"}, status="RUNNING", source="bridge")
             self._advance_workflow(
                 execution_id,
-                provider=run_record.get("resume_provider") or "stub",
+                provider=run_record.get("resume_provider") or DEFAULT_PROVIDER,
                 model_name=run_record.get("resume_model_name"),
                 endpoint=run_record.get("resume_endpoint"),
             )
         except Exception:
             pass
 
-    def _run_queued_workflow(self, run_id: str, execution_id: str, *, provider: str = "stub", model_name: Optional[str] = None, endpoint: Optional[str] = None) -> None:
+    def _run_queued_workflow(self, run_id: str, execution_id: str, *, provider: str = DEFAULT_PROVIDER, model_name: Optional[str] = None, endpoint: Optional[str] = None) -> None:
         try:
             self._sync_run_state(run_id)
             self._advance_workflow(execution_id, provider=provider, model_name=model_name, endpoint=endpoint, stop_on_pause=True)
@@ -3569,7 +3569,7 @@ class RuntimeService:
             self._record_run_event(run_id, "CONTROL_RESPONDED", {"choice": "approve"}, status="RUNNING", source="bridge")
             self._advance_workflow(
                 execution_id,
-                provider=summary.get("resume_provider") or "stub",
+                provider=summary.get("resume_provider") or DEFAULT_PROVIDER,
                 model_name=summary.get("resume_model_name"),
                 endpoint=summary.get("resume_endpoint"),
             )
