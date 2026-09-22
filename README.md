@@ -1,8 +1,33 @@
 # Hermes Core
 
-Hermes Core is a deterministic orchestration platform for local AI workflows.
+**Hermes Core is a deterministic orchestration platform for unattended AI workflows.** It plans, executes, verifies, and recovers multi-step local-AI work overnight or across restarts — with human approval as a first-class control point, and with AI models treated as replaceable capabilities behind stable interfaces.
 
-The system separates workflow control, state management, policy enforcement, and artifact lineage from model execution. AI models are treated as replaceable capabilities behind stable interfaces.
+> Design, architecture, and the decisions below were mine; implementation was done with an AI assistant.
+
+## Why I built it
+
+Long AI-assisted workflows that run unattended fail in predictable ways: they crash mid-run and lose their state, they keep going when they should stop and ask a person, and they hard-depend on one model provider. Hermes Core exists to make those failure modes structural rather than accidental:
+
+- **Survive a crash** — every state change is an event; a restart replays the log and resumes from the last checkpoint.
+- **Pause for a human** — approval is a workflow state (`WAITING_APPROVAL`), not a prompt in a terminal.
+- **Swap the model** — providers sit behind an adapter interface; the control plane never knows or cares which one is answering.
+- **Run offline** — the engine needs only the Python standard library and pytest to run and test; a local model (e.g. Ollama `qwen38-fast-128k`) or the offline `stub` provider is the default.
+
+## Design decisions
+
+The pieces worth defending in a conversation:
+
+1. **Durable per-step state machine with resume.** Each run keeps an `execution_loop` (iteration / max_iterations / phase / stop_reason) and checkpoints after pass; resume replays to the checkpoint and continues. See `engine/runtime_service.py` (`run_task`, `_save_checkpoint`, `execution_loop` state) and `engine/test_execution_loop.py`.
+2. **Human-in-the-loop as an architectural primitive.** Approval gates are persisted workflow states driven by `approve <execution_id> --approved-by ...`, with the approver and reason recorded in the event log — auditable, replayable, and impossible to lose to a crash. See the kernel/approval path in `engine/`, `hermes_cli.py` (`command_approve`), and `examples/approval_example.json`.
+3. **SQLite-lease-backed background scheduling.** Jobs are rows in SQLite; workers claim them via lease locks so no job is ever double-executed, even with multiple workers or a restarted host. See `engine/scheduler.py` / `engine/spec_scheduler.py`.
+4. **Model adapters behind a stable interface.** `engine/model_adapter.py` routes work to the configured provider (Ollama local model by default, `stub` for offline tests). The scheduler, policy engine, and kernel consume the adapter contract, never a provider SDK — which is why the whole suite runs with a local model and zero API keys.
+
+## Continuous integration
+
+- **Suite:** `python -m pytest` — 356 tests, ~35s (offline; `conftest.py` pins the `stub` provider by default, so CI needs no token, network, or Ollama).
+- **Dependency footprint:** the engine and tests import only the standard library plus `pytest`.
+- **Workflow:** `workflows/ci.yml` — matrix over Python 3.10–3.13.
+  - Note: the canonical path is `.github/workflows/ci.yml` (kept locally in this repo's working copy / git history). The current maintainer token lacks GitHub's `workflow` scope, so the pushed copy is staged at `workflows/`. To activate: re-auth `gh` with `workflow` scope, then `git mv workflows/ci.yml .github/workflows/ci.yml && git push`. A live Actions badge will be added to this README once the flow above is complete.
 
 ## Quick Start
 
@@ -91,6 +116,13 @@ Global option:
 
 - `--data-dir`: Directory for Hermes runtime persistence (default is `~/.hermes/data`, or the `HERMES_DATA_DIR` override).
 
+## Testing
+
+```bash
+python3 -m venv .venv && .venv/bin/pip install pytest
+.venv/bin/python -m pytest          # 356 tests, offline, no external services
+```
+
 ## Packaging and Smoke Testing
 
 Build the packaged executable with:
@@ -139,3 +171,7 @@ The `examples/design_review_workflow.json` workflow shows a realistic multi-step
 4. a tool request during planning via the `filesystem` tool
 5. artifact creation for architecture and implementation outputs
 6. recovery after restart using persisted state
+
+---
+
+**Portfolio:** [portfolio.jjrdev.com/hermes-core/case-study](https://portfolio.jjrdev.com/hermes-core/case-study) — the design story, architecture diagrams, and process notes for this project.
